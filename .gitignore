@@ -1,0 +1,10 @@
+/bin/
+/pkg/
+/src/
+*.o
+*.out
+smsd
+!cmd/smsd/
+# PKGBUILD/makepkg build artifacts
+*.pkg.tar.zst
+*.tar.gz

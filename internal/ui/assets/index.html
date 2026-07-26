@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smsd — SMS History</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --panel2: #232732; --border: #2c313c;
+    --fg: #e6e8ec; --muted: #8b93a1; --accent: #2196f3; --in: #232732; --out: #1f3a54;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f5f7; --panel: #ffffff; --panel2: #eef0f3; --border: #dfe3e8;
+      --fg: #1a1d22; --muted: #6b7280; --accent: #1976d2; --in: #eef0f3; --out: #d6ebff;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font: 14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg); color: var(--fg); display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px; flex: 0 0 auto;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .tag { color: var(--muted); font-size: 12px; }
+  #search {
+    margin-left: auto; width: 320px; max-width: 45vw; padding: 7px 10px;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--fg); font-size: 13px;
+  }
+  #search:focus { outline: none; border-color: var(--accent); }
+  main { display: flex; flex: 1 1 auto; min-height: 0; }
+  #list {
+    width: 320px; flex: 0 0 320px; overflow-y: auto; border-right: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .conv {
+    padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer;
+  }
+  .conv:hover { background: var(--panel2); }
+  .conv.active { background: var(--panel2); border-left: 3px solid var(--accent); padding-left: 11px; }
+  .conv .name { font-weight: 600; }
+  .conv .preview { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .conv .meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  #thread { flex: 1 1 auto; overflow-y: auto; padding: 16px 20px; min-width: 0; }
+  #thread .empty { color: var(--muted); text-align: center; margin-top: 40px; }
+  #thread h2 { font-size: 15px; margin: 0 0 14px; position: sticky; top: 0; }
+  .bubble {
+    max-width: 68%; padding: 8px 12px; border-radius: 12px; margin: 6px 0;
+    white-space: pre-wrap; word-wrap: break-word;
+  }
+  .bubble.in { background: var(--in); border-bottom-left-radius: 3px; }
+  .bubble.out { background: var(--out); margin-left: auto; border-bottom-right-radius: 3px; }
+  .bubble .ts { display: block; color: var(--muted); font-size: 10px; margin-top: 4px; }
+  .searchhit .addr { color: var(--muted); font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>smsd</h1>
+  <span class="tag">read-only SMS history</span>
+  <input id="search" type="search" placeholder="Search name, number or message…" autocomplete="off">
+</header>
+<main>
+  <div id="list"></div>
+  <div id="thread"><div class="empty">Select a conversation</div></div>
+</main>
+<script>
+const listEl = document.getElementById('list');
+const threadEl = document.getElementById('thread');
+const searchEl = document.getElementById('search');
+let active = null;
+
+function fmtDate(ms) {
+  if (!ms) return '';
+  const d = new Date(Number(ms));
+  return d.toLocaleString();
+}
+function esc(s) {
+  return (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+async function loadConversations() {
+  const r = await fetch('/api/conversations');
+  const convs = await r.json() || [];
+  listEl.innerHTML = '';
+  if (convs.length === 0) {
+    listEl.innerHTML = '<div class="conv"><div class="preview">No messages yet</div></div>';
+    return;
+  }
+  for (const c of convs) {
+    const div = document.createElement('div');
+    div.className = 'conv';
+    const title = c.contact_name || c.address;
+    div.innerHTML =
+      '<div class="name">' + esc(title) + '</div>' +
+      '<div class="preview">' + esc(c.last_body) + '</div>' +
+      '<div class="meta">' + esc(fmtDate(c.last_date)) + ' · ' + c.count + ' msgs</div>';
+    div.onclick = () => { setActive(div); openThread(c.address, title); };
+    listEl.appendChild(div);
+  }
+}
+
+function setActive(div) {
+  if (active) active.classList.remove('active');
+  active = div;
+  if (div) div.classList.add('active');
+}
+
+async function openThread(address, title) {
+  const r = await fetch('/api/messages?address=' + encodeURIComponent(address));
+  const msgs = await r.json() || [];
+  let html = '<h2>' + esc(title) + '</h2>';
+  for (const m of msgs) {
+    html += '<div class="bubble ' + (m.received ? 'in' : 'out') + '">' +
+      esc(m.body) + '<span class="ts">' + esc(fmtDate(m.date)) + '</span></div>';
+  }
+  threadEl.innerHTML = html || '<div class="empty">No messages</div>';
+  threadEl.scrollTop = threadEl.scrollHeight;
+}
+
+let searchTimer = null;
+searchEl.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  const q = searchEl.value.trim();
+  searchTimer = setTimeout(() => q ? runSearch(q) : loadConversations(), 200);
+});
+
+async function runSearch(q) {
+  const r = await fetch('/api/search?q=' + encodeURIComponent(q));
+  const hits = await r.json() || [];
+  setActive(null);
+  let html = '<h2>' + hits.length + ' result' + (hits.length === 1 ? '' : 's') + ' for “' + esc(q) + '”</h2>';
+  if (hits.length === 0) html += '<div class="empty">No matches</div>';
+  for (const m of hits) {
+    html += '<div class="bubble ' + (m.received ? 'in' : 'out') + ' searchhit">' +
+      '<div class="addr">' + esc(m.address) + ' · ' + esc(fmtDate(m.date)) + '</div>' +
+      esc(m.body) + '</div>';
+  }
+  threadEl.innerHTML = html;
+  threadEl.scrollTop = 0;
+}
+
+loadConversations();
+setInterval(() => { if (!searchEl.value.trim()) loadConversations(); }, 5000);
+</script>
+</body>
+</html>

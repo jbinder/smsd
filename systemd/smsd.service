@@ -1,0 +1,25 @@
+[Unit]
+Description=smsd — Android SMS-over-adb tray daemon
+Documentation=https://github.com/jbinder/smsd
+# Start once the graphical session (and thus the tray host) is available.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# Resolved from the user manager's PATH, so both a system install (/usr/bin)
+# and a user install (~/.local/bin) work without editing this unit.
+ExecStart=smsd
+Restart=on-failure
+RestartSec=5
+# Keep the daemon lean; it should sit well under this while idle.
+MemoryMax=64M
+# Modest hardening — smsd only needs the user's config/data/state dirs and adb.
+NoNewPrivileges=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=graphical-session.target
