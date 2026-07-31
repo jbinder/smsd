@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"strconv"
 	"sync"
 	"time"
 
@@ -63,6 +64,7 @@ func (s *Server) start() (string, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/api/state", s.handleState)
 	mux.HandleFunc("/api/conversations", s.handleConversations)
 	mux.HandleFunc("/api/messages", s.handleMessages)
 	mux.HandleFunc("/api/search", s.handleSearch)
@@ -111,11 +113,23 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// The page is embedded in the binary, so an upgrade changes it while the URL
+	// stays put. Without this a cached copy keeps serving the old viewer.
+	w.Header().Set("Cache-Control", "no-store")
 	w.Write(data)
 }
 
+func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
+	state, err := s.db.State()
+	s.writeJSON(w, state, err)
+}
+
 func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {
-	convs, err := s.db.Conversations()
+	convs, err := s.db.Conversations(
+		sinceParam(r),
+		intParam(r, "limit", 100, 1000),
+		intParam(r, "offset", 0, 1<<30),
+	)
 	s.writeJSON(w, convs, err)
 }
 
@@ -125,8 +139,36 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "address required", http.StatusBadRequest)
 		return
 	}
-	msgs, err := s.db.Messages(addr)
-	s.writeJSON(w, msgs, err)
+	cur := database.Cursor{
+		Date:      int64(intParam(r, "before_date", 0, 1<<62)),
+		AndroidID: int64(intParam(r, "before_id", 0, 1<<62)),
+	}
+	page, err := s.db.Messages(addr, sinceParam(r), cur, intParam(r, "limit", 200, 1000))
+	s.writeJSON(w, page, err)
+}
+
+// sinceParam reads the millisecond-epoch window floor shared by the list and
+// thread endpoints. Absent or zero means the whole history.
+func sinceParam(r *http.Request) int64 {
+	return int64(intParam(r, "since", 0, 1<<62))
+}
+
+// intParam reads a non-negative integer query parameter, falling back to def
+// when absent or unparseable and clamping to max so a hand-edited URL cannot
+// ask the server to materialise the whole table.
+func intParam(r *http.Request, name string, def, max int) int {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return def
+	}
+	if n > max {
+		return max
+	}
+	return n
 }
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {

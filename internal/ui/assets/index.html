@@ -48,7 +48,14 @@
   .conv .meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
   #thread { flex: 1 1 auto; overflow-y: auto; padding: 16px 20px; min-width: 0; }
   #thread .empty { color: var(--muted); text-align: center; margin-top: 40px; }
-  #thread h2 { font-size: 15px; margin: 0 0 14px; position: sticky; top: 0; }
+  /* The title needs an opaque, full-bleed background or messages scroll through
+     it. Negative margins cover the scroll area's padding, and top: -16px cancels
+     its padding-top, which sticky would otherwise treat as the pinning edge and
+     leave a strip of message visible above the title. */
+  #thread h2 {
+    font-size: 15px; position: sticky; top: -16px; z-index: 1;
+    margin: -16px -20px 14px; padding: 12px 20px; background: var(--bg);
+  }
   .bubble {
     max-width: 68%; padding: 8px 12px; border-radius: 12px; margin: 6px 0;
     white-space: pre-wrap; word-wrap: break-word;
@@ -57,12 +64,40 @@
   .bubble.out { background: var(--out); margin-left: auto; border-bottom-right-radius: 3px; }
   .bubble .ts { display: block; color: var(--muted); font-size: 10px; margin-top: 4px; }
   .searchhit .addr { color: var(--muted); font-size: 11px; }
+  .loadmore {
+    display: block; margin: 0 auto 12px; padding: 6px 14px; cursor: pointer;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--fg); font: inherit; font-size: 12px;
+  }
+  .loadmore:hover { border-color: var(--accent); }
+  .loadmore[disabled] { color: var(--muted); cursor: default; border-color: var(--border); }
+  #list .listend { padding: 10px 14px; color: var(--muted); font-size: 12px; text-align: center; }
+  #list .listend button {
+    display: block; margin: 6px auto 0; padding: 4px 10px; cursor: pointer;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--fg); font: inherit; font-size: 12px;
+  }
+  #list .listend button:hover { border-color: var(--accent); }
+  .scope { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .scope select {
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--fg); font: inherit; font-size: 12px; padding: 5px 8px;
+  }
+  .scope select:focus { outline: none; border-color: var(--accent); }
 </style>
 </head>
 <body>
 <header>
   <h1>smsd</h1>
   <span class="tag">read-only SMS history</span>
+  <label class="scope">Show
+    <select id="scope">
+      <option value="30">last month</option>
+      <option value="90">last 3 months</option>
+      <option value="365">last year</option>
+      <option value="0">everything</option>
+    </select>
+  </label>
   <input id="search" type="search" placeholder="Search name, number or message…" autocomplete="off">
 </header>
 <main>
@@ -70,10 +105,38 @@
   <div id="thread"><div class="empty">Select a conversation</div></div>
 </main>
 <script>
+// Histories here reach tens of thousands of messages across years, so nothing is
+// rendered wholesale. The primary lever is the time window: it decides which
+// conversations exist at all and which messages load, and defaults to the last
+// month. Within the window everything still pages — the list as you scroll, a
+// thread from its newest messages backwards — and the refresh poll only redraws
+// when the database has actually changed.
+const CONV_PAGE = 100;
+const MSG_PAGE = 200;
+const DAY_MS = 86400000;
+
 const listEl = document.getElementById('list');
 const threadEl = document.getElementById('thread');
 const searchEl = document.getElementById('search');
-let active = null;
+const scopeEl = document.getElementById('scope');
+
+let since = 0;             // window floor in epoch ms; 0 is the whole history
+let convLoaded = 0;        // conversations currently in the list
+let convDone = false;      // server has no more conversations
+let convLoading = false;   // an append request is in flight
+let active = null;         // address of the open conversation
+let thread = null;         // open thread paging state
+let lastToken = null;      // last /api/state fingerprint
+
+// The floor is fixed when the window changes rather than recomputed per
+// request, so the list cannot shift under the reader between polls.
+function applyScope() {
+  const days = Number(scopeEl.value);
+  since = days > 0 ? Date.now() - days * DAY_MS : 0;
+}
+function scopeLabel() {
+  return scopeEl.options[scopeEl.selectedIndex].text;
+}
 
 function fmtDate(ms) {
   if (!ms) return '';
@@ -83,45 +146,225 @@ function fmtDate(ms) {
 function esc(s) {
   return (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
+async function api(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(path + ': ' + r.status);
+  return await r.json();
+}
+
+/* ---------- conversation list ---------- */
+
+function convRow(c) {
+  const div = document.createElement('div');
+  div.className = 'conv';
+  div.dataset.address = c.address;
+  fillConvRow(div, c);
+  div.onclick = () => openThread(c.address);
+  return div;
+}
+
+// The signature lets a refresh skip rows whose rendering would not change,
+// which is what keeps an idle list from flickering.
+function fillConvRow(div, c) {
+  const sig = c.last_date + '|' + c.count + '|' + c.contact_name + '|' + c.last_body;
+  if (div.dataset.sig === sig) return;
+  div.dataset.sig = sig;
+  div.dataset.title = c.contact_name || c.address;
+  div.innerHTML =
+    '<div class="name">' + esc(div.dataset.title) + '</div>' +
+    '<div class="preview">' + esc(c.last_body) + '</div>' +
+    '<div class="meta">' + esc(fmtDate(c.last_date)) + ' · ' + c.count + ' msgs</div>';
+}
+
+// Rebuilds the list from convs, reusing the existing row elements so scroll
+// position, hover and the active highlight all survive a refresh.
+function renderConvList(convs) {
+  const existing = new Map();
+  for (const el of listEl.querySelectorAll('.conv[data-address]')) {
+    existing.set(el.dataset.address, el);
+  }
+  const frag = document.createDocumentFragment();
+  for (const c of convs) {
+    let el = existing.get(c.address);
+    if (el) { fillConvRow(el, c); existing.delete(c.address); } else { el = convRow(c); }
+    el.classList.toggle('active', c.address === active);
+    frag.appendChild(el);
+  }
+  listEl.replaceChildren(frag);
+  if (convDone) listEl.appendChild(listFooter(convs.length));
+}
+
+// Says how much of the history is in view and offers the way out of the window,
+// so a short list never looks like missing data.
+function listFooter(n) {
+  const foot = document.createElement('div');
+  foot.className = 'listend';
+  if (since === 0) {
+    foot.textContent = n === 0 ? 'No messages yet' : n + ' conversations';
+    return foot;
+  }
+  foot.textContent = n === 0
+    ? 'No conversations in the ' + scopeLabel()
+    : n + ' conversation' + (n === 1 ? '' : 's') + ' in the ' + scopeLabel();
+  const btn = document.createElement('button');
+  btn.textContent = 'Show everything';
+  btn.onclick = () => { scopeEl.value = '0'; changeScope(); };
+  foot.appendChild(btn);
+  return foot;
+}
+
+function convQuery(offset) {
+  return '/api/conversations?since=' + since + '&limit=' + CONV_PAGE +
+    (offset ? '&offset=' + offset : '');
+}
 
 async function loadConversations() {
-  const r = await fetch('/api/conversations');
-  const convs = await r.json() || [];
-  listEl.innerHTML = '';
-  if (convs.length === 0) {
-    listEl.innerHTML = '<div class="conv"><div class="preview">No messages yet</div></div>';
-    return;
-  }
-  for (const c of convs) {
-    const div = document.createElement('div');
-    div.className = 'conv';
-    const title = c.contact_name || c.address;
-    div.innerHTML =
-      '<div class="name">' + esc(title) + '</div>' +
-      '<div class="preview">' + esc(c.last_body) + '</div>' +
-      '<div class="meta">' + esc(fmtDate(c.last_date)) + ' · ' + c.count + ' msgs</div>';
-    div.onclick = () => { setActive(div); openThread(c.address, title); };
-    listEl.appendChild(div);
+  const convs = await api(convQuery(0)) || [];
+  convLoaded = convs.length;
+  convDone = convs.length < CONV_PAGE;
+  renderConvList(convs);
+}
+
+async function appendConversations() {
+  if (convDone || convLoading || searchEl.value.trim()) return;
+  convLoading = true;
+  try {
+    const convs = await api(convQuery(convLoaded)) || [];
+    convDone = convs.length < CONV_PAGE;
+    convLoaded += convs.length;
+    const frag = document.createDocumentFragment();
+    for (const c of convs) frag.appendChild(convRow(c));
+    listEl.querySelector('.listend')?.remove();
+    listEl.appendChild(frag);
+    if (convDone) listEl.appendChild(listFooter(convLoaded));
+  } finally {
+    convLoading = false;
   }
 }
 
-function setActive(div) {
-  if (active) active.classList.remove('active');
-  active = div;
-  if (div) div.classList.add('active');
+// Re-fetch exactly what is on screen so appended pages are not lost.
+async function refreshConvList() {
+  const limit = Math.min(Math.max(convLoaded, CONV_PAGE), 1000);
+  const convs = await api('/api/conversations?since=' + since + '&limit=' + limit) || [];
+  convLoaded = convs.length;
+  renderConvList(convs);
 }
 
-async function openThread(address, title) {
-  const r = await fetch('/api/messages?address=' + encodeURIComponent(address));
-  const msgs = await r.json() || [];
-  let html = '<h2>' + esc(title) + '</h2>';
-  for (const m of msgs) {
-    html += '<div class="bubble ' + (m.received ? 'in' : 'out') + '">' +
-      esc(m.body) + '<span class="ts">' + esc(fmtDate(m.date)) + '</span></div>';
+function changeScope() {
+  localStorage.setItem('smsd.scope', scopeEl.value);
+  applyScope();
+  active = null;
+  thread = null;
+  threadEl.replaceChildren(Object.assign(document.createElement('div'),
+    { className: 'empty', textContent: 'Select a conversation' }));
+  listEl.scrollTop = 0;
+  loadConversations();
+}
+scopeEl.addEventListener('change', changeScope);
+
+listEl.addEventListener('scroll', () => {
+  if (listEl.scrollTop + listEl.clientHeight >= listEl.scrollHeight - 200) appendConversations();
+});
+
+/* ---------- thread ---------- */
+
+function bubbleEl(m) {
+  const div = document.createElement('div');
+  div.className = 'bubble ' + (m.received ? 'in' : 'out');
+  div.innerHTML = esc(m.body) + '<span class="ts">' + esc(fmtDate(m.date)) + '</span>';
+  return div;
+}
+
+function threadTitle(address) {
+  const row = listEl.querySelector('.conv[data-address="' + CSS.escape(address) + '"]');
+  return (row && row.dataset.title) || address;
+}
+
+async function openThread(address) {
+  active = address;
+  for (const el of listEl.querySelectorAll('.conv')) {
+    el.classList.toggle('active', el.dataset.address === address);
   }
-  threadEl.innerHTML = html || '<div class="empty">No messages</div>';
+
+  const page = await api('/api/messages?address=' + encodeURIComponent(address) +
+    '&since=' + since + '&limit=' + MSG_PAGE);
+  const msgs = page.messages || [];
+  // thread.since mirrors the window until the reader asks for older messages,
+  // at which point it drops to 0 for this thread only.
+  thread = { address, since, hasMore: page.has_more, oldest: msgs[0] || null };
+
+  threadEl.replaceChildren();
+  const h2 = document.createElement('h2');
+  h2.textContent = threadTitle(address);
+  threadEl.appendChild(h2);
+
+  const more = document.createElement('button');
+  more.className = 'loadmore';
+  more.onclick = loadOlder;
+  threadEl.appendChild(more);
+  labelLoadMore(more);
+
+  const bubbles = document.createElement('div');
+  bubbles.id = 'bubbles';
+  if (msgs.length === 0) {
+    bubbles.innerHTML = '<div class="empty">No messages</div>';
+  } else {
+    const frag = document.createDocumentFragment();
+    for (const m of msgs) frag.appendChild(bubbleEl(m));
+    bubbles.appendChild(frag);
+  }
+  threadEl.appendChild(bubbles);
   threadEl.scrollTop = threadEl.scrollHeight;
 }
+
+// Inside the window the button pages backwards; once the window is exhausted it
+// becomes the way out of the window for this thread.
+function labelLoadMore(btn) {
+  if (!thread) { btn.hidden = true; return; }
+  if (thread.hasMore) {
+    btn.textContent = '↑ Load ' + MSG_PAGE + ' older';
+    btn.hidden = false;
+  } else if (thread.since > 0) {
+    btn.textContent = '↑ Load messages older than the ' + scopeLabel();
+    btn.hidden = false;
+  } else {
+    btn.hidden = true;
+  }
+}
+
+async function loadOlder() {
+  if (!thread || !thread.oldest) return;
+  // Out of messages inside the window: widen this thread to the full history.
+  if (!thread.hasMore && thread.since > 0) thread.since = 0;
+
+  const btn = threadEl.querySelector('.loadmore');
+  const bubbles = document.getElementById('bubbles');
+  btn.disabled = true;
+  btn.textContent = 'Loading…';
+  try {
+    const page = await api('/api/messages?address=' + encodeURIComponent(thread.address) +
+      '&since=' + thread.since +
+      '&before_date=' + thread.oldest.date + '&before_id=' + thread.oldest.android_id +
+      '&limit=' + MSG_PAGE);
+    const msgs = page.messages || [];
+    thread.hasMore = page.has_more;
+    if (msgs.length) thread.oldest = msgs[0];
+    else thread.exhausted = true;
+
+    // Prepending grows the document upwards, so shift the scroll offset by the
+    // height gained to keep the reader looking at the same message.
+    const before = threadEl.scrollHeight;
+    const frag = document.createDocumentFragment();
+    for (const m of msgs) frag.appendChild(bubbleEl(m));
+    bubbles.insertBefore(frag, bubbles.firstChild);
+    threadEl.scrollTop += threadEl.scrollHeight - before;
+  } finally {
+    btn.disabled = false;
+    if (thread.exhausted) btn.hidden = true; else labelLoadMore(btn);
+  }
+}
+
+/* ---------- search ---------- */
 
 let searchTimer = null;
 searchEl.addEventListener('input', () => {
@@ -131,9 +374,11 @@ searchEl.addEventListener('input', () => {
 });
 
 async function runSearch(q) {
-  const r = await fetch('/api/search?q=' + encodeURIComponent(q));
-  const hits = await r.json() || [];
-  setActive(null);
+  const hits = await api('/api/search?q=' + encodeURIComponent(q)) || [];
+  active = null;
+  thread = null;
+  for (const el of listEl.querySelectorAll('.conv')) el.classList.remove('active');
+
   let html = '<h2>' + hits.length + ' result' + (hits.length === 1 ? '' : 's') + ' for “' + esc(q) + '”</h2>';
   if (hits.length === 0) html += '<div class="empty">No matches</div>';
   for (const m of hits) {
@@ -145,8 +390,32 @@ async function runSearch(q) {
   threadEl.scrollTop = 0;
 }
 
-loadConversations();
-setInterval(() => { if (!searchEl.value.trim()) loadConversations(); }, 5000);
+/* ---------- refresh ---------- */
+
+// Polling a fingerprint instead of the whole list means an idle viewer does no
+// rendering work at all, and a busy one only redraws once per actual change.
+async function poll() {
+  if (searchEl.value.trim()) return;
+  const s = await api('/api/state');
+  const token = s.count + ':' + s.max_id;
+  if (token === lastToken) return;
+  const first = lastToken === null;
+  lastToken = token;
+  if (first) return;
+
+  await refreshConvList();
+  // Only pull new messages into an open thread when the reader is already at
+  // the bottom; otherwise a refresh would yank them away from what they read.
+  if (thread && threadEl.scrollTop + threadEl.clientHeight >= threadEl.scrollHeight - 40) {
+    await openThread(thread.address);
+  }
+}
+
+const saved = localStorage.getItem('smsd.scope');
+if (saved !== null && [...scopeEl.options].some(o => o.value === saved)) scopeEl.value = saved;
+applyScope();
+loadConversations().then(poll);
+setInterval(() => poll().catch(() => {}), 5000);
 </script>
 </body>
 </html>

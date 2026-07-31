@@ -65,7 +65,7 @@ func run() error {
 	defer db.Close()
 
 	client := adb.New(cfg.ADBPath)
-	notifier := notify.New(cfg.NotifyEnabled)
+	notifier := notify.New(cfg.NotifyEnabled, cfg.NotifyTimeoutSeconds)
 	if cfg.NotifyEnabled && !notifier.Available() {
 		logger.Warnf("notify-send not found on PATH; desktop notifications disabled")
 	}

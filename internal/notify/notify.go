@@ -6,20 +6,25 @@ package notify
 import (
 	"context"
 	"os/exec"
+	"strconv"
 	"time"
 )
 
 // Notifier sends desktop notifications. A zero Notifier is usable but disabled
 // until Enabled is set; use New to construct one.
 type Notifier struct {
-	enabled bool
-	bin     string // resolved notify-send path, "" if unavailable
+	enabled    bool
+	bin        string // resolved notify-send path, "" if unavailable
+	timeoutSec int    // seconds on screen; negative means never expire
 }
 
 // New returns a Notifier. If enabled is true but notify-send is not on PATH,
 // notifications are silently skipped so the daemon still runs headless.
-func New(enabled bool) *Notifier {
-	n := &Notifier{enabled: enabled}
+// timeoutSec is how long a notification stays on screen; a negative value
+// makes it stay until dismissed. Some notification daemons (notably GNOME
+// Shell) ignore the timeout hint entirely.
+func New(enabled bool, timeoutSec int) *Notifier {
+	n := &Notifier{enabled: enabled, timeoutSec: timeoutSec}
 	if path, err := exec.LookPath("notify-send"); err == nil {
 		n.bin = path
 	}
@@ -41,8 +46,21 @@ func (n *Notifier) Notify(title, body string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	// --app-name groups notifications; -u normal for received messages.
-	cmd := exec.CommandContext(ctx, n.bin,
-		"--app-name=smsd", "-u", "normal", "-i", "phone", title, body)
+	cmd := exec.CommandContext(ctx, n.bin, n.args(title, body)...)
 	_ = cmd.Run()
+}
+
+// args builds the notify-send argument list. --app-name groups notifications;
+// -u normal for received messages; -t is in milliseconds, where 0 means the
+// notification never expires.
+func (n *Notifier) args(title, body string) []string {
+	ms := n.timeoutSec * 1000
+	if n.timeoutSec < 0 {
+		ms = 0
+	}
+	return []string{
+		"--app-name=smsd", "-u", "normal", "-i", "phone",
+		"-t", strconv.Itoa(ms),
+		title, body,
+	}
 }

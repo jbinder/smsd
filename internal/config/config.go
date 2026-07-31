@@ -24,6 +24,10 @@ type Config struct {
 	ContactsRefreshMinutes int `json:"contacts_refresh_minutes"`
 	// NotifyEnabled toggles desktop notifications for newly received SMS.
 	NotifyEnabled bool `json:"notify_enabled"`
+	// NotifyTimeoutSeconds is how long a notification stays on screen. 0 means
+	// use the default; a negative value keeps it up until dismissed. Some
+	// notification daemons ignore the hint.
+	NotifyTimeoutSeconds int `json:"notify_timeout_seconds"`
 	// UIAddr is the loopback address the read-only web viewer binds to.
 	// Port 0 selects a random free port each launch.
 	UIAddr string `json:"ui_addr"`
@@ -39,6 +43,7 @@ func Default() Config {
 		SMSPollSeconds:         2,
 		ContactsRefreshMinutes: 15,
 		NotifyEnabled:          true,
+		NotifyTimeoutSeconds:   30,
 		UIAddr:                 "127.0.0.1:0",
 		LogMaxBytes:            5 * 1024 * 1024,
 	}
@@ -146,6 +151,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.ContactsRefreshMinutes <= 0 {
 		cfg.ContactsRefreshMinutes = d.ContactsRefreshMinutes
+	}
+	if cfg.NotifyTimeoutSeconds == 0 {
+		cfg.NotifyTimeoutSeconds = d.NotifyTimeoutSeconds
 	}
 	if cfg.UIAddr == "" {
 		cfg.UIAddr = d.UIAddr

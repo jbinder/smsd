@@ -16,8 +16,10 @@ installed on the phone.
 - Caches contacts from the Android Contacts Provider so conversations show names.
 - Read-only conversation viewer in your browser, with search by phone number,
   contact name, or message body.
-- System tray icon with four states — disconnected, connected, unread, error —
-  and a menu: Open SMS History, Refresh, Mark notifications read, Reconnect, Quit.
+- System tray icon — an SMS speech bubble in four states: hollow grey when no
+  device is attached, filled green when connected, blue on unread messages, and
+  red with an exclamation mark on error. Its menu offers Open SMS History,
+  Refresh, Mark notifications read, Reconnect and Quit.
 
 ### Efficient polling
 
@@ -110,6 +112,41 @@ systemctl --user enable --now smsd.service
 journalctl --user -u smsd -f      # follow logs (also written to the log file below)
 ```
 
+### Autostart under a bare window manager (i3, sway, …)
+
+The unit is `WantedBy=graphical-session.target`, which full desktop environments
+activate for you. Plain window managers do **not** — so an enabled smsd silently
+never starts at login. You cannot start that target by hand either; systemd
+marks it `RefuseManualStart`, so it may only be pulled in as a dependency.
+
+Add a session target that pulls it in, `~/.config/systemd/user/i3-session.target`:
+
+```ini
+[Unit]
+Description=i3 session
+BindsTo=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
+```
+
+and start it from your WM config (`~/.config/i3/config`):
+
+```
+exec --no-startup-id "systemctl --user import-environment DISPLAY XAUTHORITY; systemctl --user start i3-session.target"
+```
+
+The quotes matter: i3 splits config lines on `;` unless the command is quoted.
+`import-environment` is what lets smsd open the viewer in your browser — the user
+manager may be started before X (and stays alive across logout if you have
+lingering enabled), so it does not otherwise know `DISPLAY`.
+
+For sway, use `exec` with the same two commands and name the target
+`sway-session.target`. Verify with:
+
+```sh
+systemctl --user is-active graphical-session.target smsd.service   # active, active
+```
+
 ### Installing without root
 
 You can install to your home directory instead of using `sudo`:
@@ -150,6 +187,7 @@ systemctl --user daemon-reload
   "sms_poll_seconds": 2,
   "contacts_refresh_minutes": 15,
   "notify_enabled": true,
+  "notify_timeout_seconds": 30,
   "ui_addr": "127.0.0.1:0",
   "log_max_bytes": 5242880
 }
@@ -157,6 +195,10 @@ systemctl --user daemon-reload
 
 - `adb_path` — override the `adb` binary; empty means look it up on `PATH`.
 - `ui_addr` — loopback bind address for the viewer; port `0` picks a free port.
+- `notify_timeout_seconds` — how long a notification stays on screen. Use a
+  negative value to keep it up until dismissed. Your notification daemon has
+  the last word: dunst honours the hint (unless overridden by a rule), GNOME
+  Shell ignores it.
 
 ## The viewer
 
@@ -172,6 +214,43 @@ honours `$BROWSER` and your XDG default. Notes:
 - The first launch after login can be slow if your browser is not already
   running; the browser is launched fire-and-forget, so a failed launch is silent.
 - The server binds to loopback only and is read-only.
+
+### Time window
+
+Histories run to tens of thousands of messages over years, which no browser
+renders comfortably in one pass. The viewer's main lever is a **time window**,
+set by the *Show* selector in the header and defaulting to the **last month**:
+
+- The window applies to everything. A conversation with no traffic inside it does
+  not appear in the list at all, and the per-conversation message count describes
+  the window rather than all time.
+- The list footer reports what is in view (`8 conversations in the last month`)
+  and offers **Show everything**, so a short list never reads as missing data.
+- Opening a thread loads only its in-window messages. A **↑ Load messages older
+  than the last month** button at the top widens that thread to the full history.
+- The choice is remembered in `localStorage` across sessions.
+
+Within the window everything still pages, so a busy month cannot flood the page:
+the list loads 100 conversations at a time as you scroll, and a thread loads its
+newest 200 messages with a **↑ Load 200 older** button. Paging is keyset-based on
+`(date, android_id)`, so it stays correct even when messages share a timestamp.
+
+The viewer also polls `/api/state` — a message count and highest row id — every
+five seconds and only redraws when that changes, leaving scroll position and the
+selected conversation untouched while idle.
+
+The JSON API takes the same parameters, should you want to script against it
+(`since` is a millisecond epoch floor; omit or pass `0` for the whole history):
+
+```sh
+curl "$URL/api/state"
+curl "$URL/api/conversations?since=1780000000000&limit=100&offset=0"
+curl "$URL/api/messages?address=%2B15551234567&since=1780000000000&limit=200"
+curl "$URL/api/messages?address=%2B15551234567&before_date=…&before_id=…"
+```
+
+`has_more` in the `/api/messages` response reports whether older messages remain
+*inside the requested window*; drop `since` from the next request to read past it.
 
 ## Architecture
 
