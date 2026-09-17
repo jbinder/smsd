@@ -130,6 +130,10 @@ func (t *Tray) SetState(state State, tooltip string) {
 }
 
 func (t *Tray) apply(state State, tooltip string) {
+	// systray panics rather than erroring once its D-Bus connection is gone,
+	// which happens whenever a poll races the tray teardown at shutdown. A
+	// lost icon update at that point is nothing worth crashing over.
+	defer func() { _ = recover() }()
 	if icon, ok := t.icons[state]; ok {
 		systray.SetIcon(icon)
 	}

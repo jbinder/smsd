@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 	"sync"
@@ -194,7 +195,30 @@ func (s *Server) writeJSON(w http.ResponseWriter, v any, err error) {
 }
 
 // openBrowser launches the default browser without blocking on it.
+//
+// A plain child process would inherit the daemon's cgroup, and the systemd
+// unit caps that at a few tens of megabytes to keep the daemon honest. A
+// browser blows through the cap within seconds and the OOM killer takes the
+// browser and the daemon down together. Under systemd the browser is therefore
+// started in a transient scope of its own, which moves it out from under the
+// daemon's limit while keeping the daemon's environment (DISPLAY, session bus).
 func openBrowser(url string) error {
-	cmd := exec.Command("xdg-open", url)
-	return cmd.Start()
+	var cmd *exec.Cmd
+	if os.Getenv("INVOCATION_ID") != "" {
+		if run, err := exec.LookPath("systemd-run"); err == nil {
+			cmd = exec.Command(run, "--user", "--scope", "--quiet", "--collect",
+				"--unit=smsd-viewer-"+strconv.FormatInt(time.Now().UnixMilli(), 36),
+				"xdg-open", url)
+		}
+	}
+	if cmd == nil {
+		cmd = exec.Command("xdg-open", url)
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	// Reap the launcher so it does not linger as a zombie; the browser itself
+	// outlives it.
+	go cmd.Wait()
+	return nil
 }
