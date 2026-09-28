@@ -1,6 +1,5 @@
 // Package database owns the local SQLite store: schema, deduplicated SMS
-// import, contacts, deletion tracking and the read-only queries the viewer
-// uses. It uses the pure-Go modernc.org/sqlite driver so the binary needs no
+// import, contacts, deletion tracking and the queries the viewer uses. It uses the pure-Go modernc.org/sqlite driver so the binary needs no
 // cgo.
 package database
 
@@ -517,4 +516,60 @@ func normalizeSQL(col string) string {
 		expr = "REPLACE(" + expr + ", " + ch + ", '')"
 	}
 	return "substr(" + expr + ", -10)"
+}
+
+// ConversationDevice returns the device that most recently exchanged a message
+// with address, or "" if none has. Replies go out from the same phone.
+func (d *DB) ConversationDevice(address string) (string, error) {
+	var device string
+	err := d.db.QueryRow(
+		`SELECT device FROM messages WHERE address = ? ORDER BY date DESC LIMIT 1`, address,
+	).Scan(&device)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return device, err
+}
+
+// PendingOutgoing returns the android ids of device's outgoing messages that
+// were imported while still waiting to be sent. The incremental import only
+// ever sees a row once, so these are re-read until they settle.
+func (d *DB) PendingOutgoing(device string) ([]int64, error) {
+	rows, err := d.db.Query(
+		`SELECT android_id FROM messages WHERE device = ? AND type IN (?, ?) AND deleted_at IS NULL`,
+		device, sms.TypeOutbox, sms.TypeQueued)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// UpdateTypes records the current type of device's messages, keyed by android
+// id, and reports how many changed.
+func (d *DB) UpdateTypes(device string, types map[int64]int) (int, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	changed := 0
+	for id, typ := range types {
+		r, err := tx.Exec(`UPDATE messages SET type = ? WHERE device = ? AND android_id = ? AND type <> ?`,
+			typ, device, id, typ)
+		if err != nil {
+			return 0, err
+		}
+		n, _ := r.RowsAffected()
+		changed += int(n)
+	}
+	return changed, tx.Commit()
 }

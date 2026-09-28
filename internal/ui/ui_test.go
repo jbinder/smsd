@@ -1,12 +1,16 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/jbinder/smsd/internal/contact"
@@ -237,5 +241,103 @@ func TestContactEndpoints(t *testing.T) {
 		if resp.StatusCode != want {
 			t.Errorf("GET %s = %d, want %d", path, resp.StatusCode, want)
 		}
+	}
+}
+
+type fakeSender struct {
+	status error
+	sent   []string
+}
+
+func (f *fakeSender) SendStatus() error { return f.status }
+func (f *fakeSender) Send(ctx context.Context, address, body string) (string, error) {
+	f.sent = append(f.sent, address+": "+body)
+	return address, nil
+}
+
+func TestSendEndpointAuthorisation(t *testing.T) {
+	dir := t.TempDir()
+	db, err := database.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	log, err := logging.New(filepath.Join(dir, "log.txt"), 1<<20, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	s := New(db, "127.0.0.1:0", log)
+	fake := &fakeSender{}
+	s.SetSender(fake)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/api/send", s.handleSend)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// The page carries the token the send has to present.
+	resp, err := srv.Client().Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(page), s.token) || strings.Contains(string(page), "%SMSD_TOKEN%") {
+		t.Fatalf("page does not carry the token")
+	}
+
+	send := func(method string, headers map[string]string, body string) int {
+		t.Helper()
+		req, _ := http.NewRequest(method, srv.URL+"/api/send", strings.NewReader(body))
+		for k, v := range headers {
+			if k == "Host" {
+				req.Host = v
+			} else {
+				req.Header.Set(k, v)
+			}
+		}
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	good := `{"address":"+15551234567","body":"hi"}`
+	ok := map[string]string{"X-Smsd-Token": s.token, "Origin": srv.URL}
+
+	for name, tc := range map[string]struct {
+		method  string
+		headers map[string]string
+		body    string
+		want    int
+	}{
+		"no token":        {"POST", map[string]string{"Origin": srv.URL}, good, http.StatusForbidden},
+		"wrong token":     {"POST", map[string]string{"X-Smsd-Token": "nope", "Origin": srv.URL}, good, http.StatusForbidden},
+		"foreign origin":  {"POST", map[string]string{"X-Smsd-Token": s.token, "Origin": "https://evil.example"}, good, http.StatusForbidden},
+		"rebinding host":  {"POST", map[string]string{"X-Smsd-Token": s.token, "Host": "evil.example:8730"}, good, http.StatusForbidden},
+		"GET":             {"GET", ok, "", http.StatusMethodNotAllowed},
+		"empty body text": {"POST", ok, `{"address":"+1555","body":"  "}`, http.StatusBadRequest},
+		"malformed":       {"POST", ok, `{`, http.StatusBadRequest},
+	} {
+		if got := send(tc.method, tc.headers, tc.body); got != tc.want {
+			t.Errorf("%s: status %d, want %d", name, got, tc.want)
+		}
+	}
+	if len(fake.sent) != 0 {
+		t.Fatalf("rejected requests sent %v", fake.sent)
+	}
+
+	if got := send("POST", ok, good); got != http.StatusOK {
+		t.Fatalf("authorised send: status %d", got)
+	}
+	if len(fake.sent) != 1 || fake.sent[0] != "+15551234567: hi" {
+		t.Errorf("sent = %v", fake.sent)
+	}
+
+	fake.status = errors.New("no phone connected")
+	if got := send("POST", ok, good); got != http.StatusServiceUnavailable {
+		t.Errorf("send without phone: status %d, want 503", got)
 	}
 }

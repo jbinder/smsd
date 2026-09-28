@@ -13,6 +13,9 @@ import (
 const (
 	TypeReceived = 1 // MESSAGE_TYPE_INBOX
 	TypeSent     = 2 // MESSAGE_TYPE_SENT
+	TypeOutbox   = 4 // MESSAGE_TYPE_OUTBOX: being sent
+	TypeFailed   = 5 // MESSAGE_TYPE_FAILED
+	TypeQueued   = 6 // MESSAGE_TYPE_QUEUED: waiting to be sent
 )
 
 // Projection is the ordered list of columns smsd requests. "body" MUST remain

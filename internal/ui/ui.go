@@ -1,19 +1,25 @@
-// Package ui serves a read-only SMS conversation viewer over loopback HTTP and
-// opens it in the user's browser. A tiny embedded single-page app keeps the
+// Package ui serves the SMS conversation viewer over loopback HTTP and opens it
+// in the user's browser. Its only write is sending an SMS. A tiny embedded single-page app keeps the
 // idle daemon lightweight: no GUI toolkit is linked and the server only runs
 // while the viewer is open.
 package ui
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,11 +30,23 @@ import (
 //go:embed assets/index.html
 var assets embed.FS
 
+// Sender sends SMS on the viewer's behalf.
+type Sender interface {
+	// SendStatus returns nil when sending can work, or why it cannot.
+	SendStatus() error
+	// Send sends body to address and returns the address actually used.
+	Send(ctx context.Context, address, body string) (string, error)
+}
+
 // Server is the loopback web viewer. It starts lazily on first Open.
 type Server struct {
-	db   *database.DB
-	log  *logging.Logger
-	addr string
+	db     *database.DB
+	log    *logging.Logger
+	addr   string
+	sender Sender
+	// token authorises sends. It is generated per run and only handed out
+	// inside the page, which other sites cannot read.
+	token string
 
 	mu      sync.Mutex
 	srv     *http.Server
@@ -38,8 +56,15 @@ type Server struct {
 
 // New creates a viewer server bound (on start) to addr, e.g. "127.0.0.1:0".
 func New(db *database.DB, addr string, log *logging.Logger) *Server {
-	return &Server{db: db, log: log, addr: addr}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		panic(err) // crypto/rand does not fail on Linux
+	}
+	return &Server{db: db, log: log, addr: addr, token: hex.EncodeToString(buf)}
 }
+
+// SetSender enables sending from the viewer.
+func (s *Server) SetSender(sender Sender) { s.sender = sender }
 
 // Open ensures the server is running and launches the browser at its URL.
 func (s *Server) Open() error {
@@ -71,6 +96,7 @@ func (s *Server) start() (string, error) {
 	mux.HandleFunc("/api/search", s.handleSearch)
 	mux.HandleFunc("/api/contacts", s.handleContacts)
 	mux.HandleFunc("/api/contact", s.handleContact)
+	mux.HandleFunc("/api/send", s.handleSend)
 
 	s.srv = &http.Server{
 		Handler:           mux,
@@ -115,6 +141,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "ui asset missing", http.StatusInternalServerError)
 		return
 	}
+	data = bytes.Replace(data, []byte("%SMSD_TOKEN%"), []byte(s.token), 1)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	// The page is embedded in the binary, so an upgrade changes it while the URL
 	// stays put. Without this a cached copy keeps serving the old viewer.
@@ -122,9 +149,112 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
+// viewerState is the database fingerprint plus whether sending works right
+// now, so the compose box can say why it is disabled.
+type viewerState struct {
+	database.State
+	CanSend   bool   `json:"can_send"`
+	SendError string `json:"send_error,omitempty"`
+}
+
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	state, err := s.db.State()
-	s.writeJSON(w, state, err)
+	v := viewerState{State: state}
+	if sendErr := s.sendStatus(); sendErr != nil {
+		v.SendError = sendErr.Error()
+	} else {
+		v.CanSend = true
+	}
+	s.writeJSON(w, v, err)
+}
+
+func (s *Server) sendStatus() error {
+	if s.sender == nil {
+		return fmt.Errorf("sending is not available")
+	}
+	return s.sender.SendStatus()
+}
+
+// sendTimeout bounds a send. It is not tied to the request: a browser that
+// goes away mid-send must not cut a multipart message short.
+const sendTimeout = 90 * time.Second
+
+// handleSend sends one SMS. This is the viewer's only write, and it costs
+// money, so it only accepts requests the viewer page itself made — see
+// authorised.
+func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.authorised(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	var req struct {
+		Address string `json:"address"`
+		Body    string `json:"body"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Address) == "" || strings.TrimSpace(req.Body) == "" {
+		http.Error(w, "recipient and message are required", http.StatusBadRequest)
+		return
+	}
+	if err := s.sendStatus(); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+	defer cancel()
+	sentTo, err := s.sender.Send(ctx, req.Address, req.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	s.writeJSON(w, struct {
+		Address string `json:"address"`
+	}{sentTo}, nil)
+}
+
+// authorised accepts a send only from the viewer page. Any site open in the
+// user's browser can make it POST to a loopback port, so:
+//   - the page's per-run token must come back in a header. Other origins
+//     cannot read the page to learn it, and a custom header also forces a
+//     CORS preflight, which this server never approves;
+//   - Host must be loopback, which defeats DNS rebinding — a hostile name
+//     re-pointed at 127.0.0.1 would otherwise be same-origin with us;
+//   - Origin, which browsers send on POST, must be loopback too.
+func (s *Server) authorised(r *http.Request) bool {
+	token := r.Header.Get("X-Smsd-Token")
+	if subtle.ConstantTimeCompare([]byte(token), []byte(s.token)) != 1 {
+		return false
+	}
+	if !isLoopbackHost(r.Host) {
+		return false
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || !isLoopbackHost(u.Host) {
+			return false
+		}
+	}
+	return true
+}
+
+func isLoopbackHost(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {

@@ -25,13 +25,15 @@ type Config struct {
 	// DeletedCheckMinutes is how often a connected device is checked for
 	// messages deleted from the phone, which are then marked deleted.
 	DeletedCheckMinutes int `json:"deleted_check_minutes"`
+	// SendEnabled allows sending SMS from the viewer.
+	SendEnabled bool `json:"send_enabled"`
 	// NotifyEnabled toggles desktop notifications for newly received SMS.
 	NotifyEnabled bool `json:"notify_enabled"`
 	// NotifyTimeoutSeconds is how long a notification stays on screen. 0 means
 	// use the default; a negative value keeps it up until dismissed. Some
 	// notification daemons ignore the hint.
 	NotifyTimeoutSeconds int `json:"notify_timeout_seconds"`
-	// UIAddr is the loopback address the read-only web viewer binds to.
+	// UIAddr is the loopback address the web viewer binds to.
 	// Port 0 selects a random free port each launch.
 	UIAddr string `json:"ui_addr"`
 	// LogMaxBytes is the size at which the log file is rotated.
@@ -46,6 +48,7 @@ func Default() Config {
 		SMSPollSeconds:         2,
 		ContactsRefreshMinutes: 15,
 		DeletedCheckMinutes:    15,
+		SendEnabled:            true,
 		NotifyEnabled:          true,
 		NotifyTimeoutSeconds:   30,
 		UIAddr:                 "127.0.0.1:0",

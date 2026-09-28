@@ -6,7 +6,10 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -220,7 +223,30 @@ func (a *App) pollOnce(ctx context.Context, serial string, backfill *bool) {
 	}
 
 	a.notifyReceived(res.NewlyReceived)
+	a.settlePending(ctx, serial)
 	a.refreshState()
+}
+
+// settlePending re-reads outgoing messages that were imported before the
+// phone finished sending them, so they do not stay "sending" forever.
+func (a *App) settlePending(ctx context.Context, serial string) {
+	ids, err := a.db.PendingOutgoing(serial)
+	if err != nil || len(ids) == 0 {
+		if err != nil {
+			a.log.Errorf("device %s: pending messages: %v", serial, err)
+		}
+		return
+	}
+	types, err := a.adb.QuerySMSTypes(ctx, serial, ids)
+	if err != nil {
+		if ctx.Err() == nil {
+			a.log.Warnf("device %s: re-reading pending messages: %v", serial, err)
+		}
+		return
+	}
+	if _, err := a.db.UpdateTypes(serial, types); err != nil {
+		a.log.Errorf("device %s: updating pending messages: %v", serial, err)
+	}
 }
 
 func backfillNote(b bool) string {
@@ -307,6 +333,83 @@ func (a *App) checkDeleted(ctx context.Context, serial string) {
 	}
 }
 
+// --- sending ----------------------------------------------------------------
+
+// ErrNoDevice is returned by Send when no phone is connected.
+var ErrNoDevice = errors.New("no phone connected")
+
+// ErrSendDisabled is returned by Send when send_enabled is off.
+var ErrSendDisabled = errors.New("sending is disabled in the configuration")
+
+// SendStatus reports whether Send can currently work, and if not, why.
+func (a *App) SendStatus() error {
+	if !a.cfg.SendEnabled {
+		return ErrSendDisabled
+	}
+	a.mu.Lock()
+	n := len(a.devices)
+	a.mu.Unlock()
+	if n == 0 {
+		return ErrNoDevice
+	}
+	return nil
+}
+
+// Send sends body to address and returns the address it was sent to, with a
+// phone number's formatting stripped (see sms.Dialable). A reply goes out from
+// the phone the conversation was last on, when it is connected; otherwise from
+// a connected phone. The sent message reaches the database through the
+// regular import.
+func (a *App) Send(ctx context.Context, address, body string) (string, error) {
+	if err := a.SendStatus(); err != nil {
+		return "", err
+	}
+	address = sms.Dialable(address)
+	if address == "" || strings.TrimSpace(body) == "" {
+		return "", errors.New("recipient and message are required")
+	}
+
+	preferred, err := a.db.ConversationDevice(address)
+	if err != nil {
+		return "", err
+	}
+	serial, poke := a.sendDevice(preferred)
+	if serial == "" {
+		return "", ErrNoDevice
+	}
+
+	parts := sms.Split(body)
+	if err := a.adb.SendSMS(ctx, serial, address, parts); err != nil {
+		a.log.Errorf("device %s: sending to %s: %v", serial, address, err)
+		return "", err
+	}
+	a.log.Infof("device %s: sent %d-part message to %s", serial, len(parts), address)
+	select {
+	case poke <- struct{}{}:
+	default:
+	}
+	return address, nil
+}
+
+// sendDevice picks the connected device to send from, preferring preferred,
+// and returns it with its poke channel.
+func (a *App) sendDevice(preferred string) (string, chan struct{}) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if ds, ok := a.devices[preferred]; ok {
+		return preferred, ds.poke
+	}
+	serials := make([]string, 0, len(a.devices))
+	for s := range a.devices {
+		serials = append(serials, s)
+	}
+	if len(serials) == 0 {
+		return "", nil
+	}
+	sort.Strings(serials)
+	return serials[0], a.devices[serials[0]].poke
+}
+
 // --- tray state -----------------------------------------------------------
 
 // refreshState recomputes and applies the tray icon/tooltip from current state.
@@ -352,7 +455,7 @@ func (a *App) stopAllDevices() {
 
 // --- tray action handlers -------------------------------------------------
 
-// OpenHistory opens the read-only viewer in the browser.
+// OpenHistory opens the viewer in the browser.
 func (a *App) OpenHistory() {
 	if err := a.ui.Open(); err != nil {
 		a.log.Errorf("opening viewer: %v", err)

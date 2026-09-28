@@ -1,5 +1,6 @@
 // Command smsd is a native Linux tray daemon that imports SMS from an Android
-// phone over adb into a local SQLite store and provides a read-only viewer.
+// phone over adb into a local SQLite store and provides a viewer that can also
+// send SMS.
 package main
 
 import (
@@ -73,6 +74,7 @@ func run() error {
 	defer viewer.Stop()
 
 	application := app.New(cfg, logger, client, db, notifier, viewer)
+	viewer.SetSender(application)
 
 	// Root context cancelled on quit or signal.
 	ctx, cancel := context.WithCancel(context.Background())

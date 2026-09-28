@@ -1,7 +1,8 @@
 # smsd
 
 A small, native Linux tray daemon that mirrors your Android phone's SMS to a
-local SQLite database over `adb` and gives you a read-only, searchable history.
+local SQLite database over `adb` and gives you a searchable history you can
+reply from.
 Built for Arch Linux + i3wm. No Electron, no Qt, no Python, no root, and no app
 installed on the phone.
 
@@ -18,8 +19,10 @@ installed on the phone.
   deleted; if it comes back, the mark is cleared.
 - Notifies (via libnotify) only for **newly received** messages — the first
   import of a phone's history is silent.
-- Read-only viewer in your browser: conversations with search by phone number,
-  contact name, or message body, and a Contacts tab with each contact's card.
+- Viewer in your browser: conversations with search by phone number, contact
+  name, or message body, and a Contacts tab with each contact's card.
+- Sends SMS from the viewer — replies and new messages — through the phone,
+  still with no app installed on it.
 - System tray icon — an SMS speech bubble in four states: hollow grey when no
   device is attached, filled green when connected, blue on unread messages, and
   red with an exclamation mark on error. Its menu offers Open SMS History,
@@ -200,6 +203,7 @@ systemctl --user daemon-reload
   "sms_poll_seconds": 2,
   "contacts_refresh_minutes": 15,
   "deleted_check_minutes": 15,
+  "send_enabled": true,
   "notify_enabled": true,
   "notify_timeout_seconds": 30,
   "ui_addr": "127.0.0.1:0",
@@ -209,6 +213,7 @@ systemctl --user daemon-reload
 
 - `adb_path` — override the `adb` binary; empty means look it up on `PATH`.
 - `ui_addr` — loopback bind address for the viewer; port `0` picks a free port.
+- `send_enabled` — allow sending SMS from the viewer.
 - `contacts_refresh_minutes` — how often contacts are re-synced.
 - `deleted_check_minutes` — how often the phone is checked for deleted messages.
 - `notify_timeout_seconds` — how long a notification stays on screen. Use a
@@ -229,7 +234,41 @@ honours `$BROWSER` and your XDG default. Notes:
   stable URL.
 - The first launch after login can be slow if your browser is not already
   running; the browser is launched fire-and-forget, so a failed launch is silent.
-- The server binds to loopback only and is read-only.
+- The server binds to loopback only. Its only write is sending an SMS, which
+  it accepts from the viewer page alone — see [Sending](#sending).
+
+### Sending
+
+Open a conversation and type in the box under it, or use **✎ New message** and
+pick a contact or type a number. A contact card's numbers you have not
+texted yet get a **Write SMS →** button. **Ctrl+Enter** or **Send** sends;
+plain Enter is a new line, so a message cannot go out by accident. The counter
+shows how many SMS the text takes: 160 characters fit one message in the GSM
+alphabet (153 per part once split); a single character outside it, such as an
+emoji or a typographic dash, makes it 70 (67 per part). Longer text goes out as
+one concatenated message.
+
+There is no app on the phone to hand the message to, so smsd calls Android's
+telephony service directly as the adb shell user, which is allowed to send SMS
+(`adb shell service call isms …`). Android then files the message in the sent
+folder itself, and the regular import brings it into the viewer within a few
+seconds; until then it shows as *sending…*. A message the network refuses shows
+as *not sent*. A reply goes out from the phone the conversation was last on;
+formatting is stripped from numbers (`+44 7843 174004` → `+447843174004`) so a
+reply lands in the same conversation as the messages it answers.
+
+Caveats:
+
+- The service is internal to Android and its call numbers can change between
+  releases. smsd only sends on versions it has been checked against — currently
+  **Android 13** — and says so rather than guessing on anything else.
+- "Sent" means the phone accepted the message, not that it was delivered.
+- Set `"send_enabled": false` to turn sending off.
+
+A loopback server that can send SMS is a target: any web page open in your
+browser can make it POST to `127.0.0.1`. The send endpoint therefore requires a
+random per-run token that only the viewer page carries, a loopback `Host`
+(against DNS rebinding) and, when present, a loopback `Origin`.
 
 ### Contacts and deletions
 
@@ -305,18 +344,20 @@ internal/database   SQLite schema, dedup import, contacts, deletion marks, searc
 internal/adb        adb client: server, devices, sms/contacts queries
 internal/notify     libnotify (notify-send) notifications
 internal/tray       StatusNotifierItem tray + generated state icons
-internal/ui         embedded read-only web viewer served on loopback
+internal/ui         embedded web viewer served on loopback, incl. sending
 internal/app        device monitor + per-device incremental sync loops
 ```
 
-The code is deliberately modular: adding **MMS** or **sending SMS** later means a
-new query/writer in `internal/adb` plus storage in `internal/database`, without
-touching the tray, notifier, or viewer.
+The code is deliberately modular: adding **MMS** later means a new query in
+`internal/adb` plus storage in `internal/database`, without touching the tray
+or notifier. Supporting sending on another Android release means adding its
+`ISms` transaction codes to the table in `internal/adb`.
 
 ## Limitations
 
-- Read-only: smsd never sends or deletes messages on the phone, and never
-  writes to its contacts.
+- smsd never deletes messages on the phone or writes to its contacts; its
+  only change to the phone is sending the SMS you write.
+- Sending needs a supported Android version (currently 13) and a SIM.
 - SMS only (no MMS/RCS yet).
 - Requires the phone unlocked and USB debugging authorised for the host.
 

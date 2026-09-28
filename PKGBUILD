@@ -2,7 +2,7 @@
 pkgname=smsd
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Native Linux tray daemon that imports Android SMS over adb into local SQLite with a read-only viewer"
+pkgdesc="Native Linux tray daemon that imports Android SMS over adb into local SQLite with a viewer that can send SMS"
 arch=('x86_64' 'aarch64')
 url="https://github.com/jbinder/smsd"
 license=('MIT')
