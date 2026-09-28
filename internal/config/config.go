@@ -19,9 +19,12 @@ type Config struct {
 	DevicePollSeconds int `json:"device_poll_seconds"`
 	// SMSPollSeconds is how often a connected device is queried for new SMS.
 	SMSPollSeconds int `json:"sms_poll_seconds"`
-	// ContactsRefreshMinutes is how often the contact cache is refreshed while
-	// a device is connected.
+	// ContactsRefreshMinutes is how often contacts are re-synced while a
+	// device is connected.
 	ContactsRefreshMinutes int `json:"contacts_refresh_minutes"`
+	// DeletedCheckMinutes is how often a connected device is checked for
+	// messages deleted from the phone, which are then marked deleted.
+	DeletedCheckMinutes int `json:"deleted_check_minutes"`
 	// NotifyEnabled toggles desktop notifications for newly received SMS.
 	NotifyEnabled bool `json:"notify_enabled"`
 	// NotifyTimeoutSeconds is how long a notification stays on screen. 0 means
@@ -42,6 +45,7 @@ func Default() Config {
 		DevicePollSeconds:      2,
 		SMSPollSeconds:         2,
 		ContactsRefreshMinutes: 15,
+		DeletedCheckMinutes:    15,
 		NotifyEnabled:          true,
 		NotifyTimeoutSeconds:   30,
 		UIAddr:                 "127.0.0.1:0",
@@ -151,6 +155,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.ContactsRefreshMinutes <= 0 {
 		cfg.ContactsRefreshMinutes = d.ContactsRefreshMinutes
+	}
+	if cfg.DeletedCheckMinutes <= 0 {
+		cfg.DeletedCheckMinutes = d.DeletedCheckMinutes
 	}
 	if cfg.NotifyTimeoutSeconds == 0 {
 		cfg.NotifyTimeoutSeconds = d.NotifyTimeoutSeconds

@@ -70,6 +70,7 @@
     color: var(--fg); font: inherit; font-size: 12px;
   }
   .loadmore:hover { border-color: var(--accent); }
+  .loadmore[hidden] { display: none; }
   .loadmore[disabled] { color: var(--muted); cursor: default; border-color: var(--border); }
   #list .listend { padding: 10px 14px; color: var(--muted); font-size: 12px; text-align: center; }
   #list .listend button {
@@ -84,18 +85,65 @@
     color: var(--fg); font: inherit; font-size: 12px; padding: 5px 8px;
   }
   .scope select:focus { outline: none; border-color: var(--accent); }
+  .scope[hidden] { display: none; }
+  .tabs { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  .tabs button {
+    background: var(--panel2); border: 0; color: var(--muted); font: inherit; font-size: 12px;
+    padding: 5px 12px; cursor: pointer;
+  }
+  .tabs button + button { border-left: 1px solid var(--border); }
+  .tabs button.on { background: var(--accent); color: #fff; }
+  /* Nothing is removed when the phone deletes it; it is kept and marked. */
+  .bubble.deleted { opacity: .6; outline: 1px dashed var(--muted); outline-offset: -1px; }
+  .gone {
+    display: inline-block; font-size: 10px; font-weight: 600; letter-spacing: .02em;
+    color: var(--muted); border: 1px solid var(--border); border-radius: 4px;
+    padding: 0 5px; margin-left: 6px; vertical-align: 1px;
+  }
+  .conv.deleted .name { color: var(--muted); }
+  .star { color: #f5b301; margin-left: 4px; }
+  .card h2 .gone { font-size: 11px; }
+  .card .banner { color: var(--muted); font-size: 12px; margin: -6px 0 14px; }
+  .card h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+    margin: 18px 0 6px; font-weight: 600;
+  }
+  .card .field {
+    display: flex; align-items: baseline; gap: 12px; padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .card .field .label { color: var(--muted); font-size: 12px; width: 110px; flex: 0 0 110px; }
+  .card .field .value { white-space: pre-wrap; word-wrap: break-word; min-width: 0; flex: 1 1 auto; }
+  .card .field.deleted .value { text-decoration: line-through; color: var(--muted); }
+  .card .field a { color: var(--accent); }
+  .card .field button {
+    flex: 0 0 auto; padding: 3px 9px; cursor: pointer; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 6px; color: var(--fg); font: inherit; font-size: 12px;
+  }
+  .card .field button:hover { border-color: var(--accent); }
 </style>
 </head>
 <body>
 <header>
   <h1>smsd</h1>
   <span class="tag">read-only SMS history</span>
-  <label class="scope">Show
+  <div class="tabs">
+    <button id="tab-messages" class="on">Messages</button>
+    <button id="tab-contacts">Contacts</button>
+  </div>
+  <label class="scope" id="scope-wrap">Show
     <select id="scope">
       <option value="30">last month</option>
       <option value="90">last 3 months</option>
       <option value="365">last year</option>
       <option value="0">everything</option>
+    </select>
+  </label>
+  <label class="scope" id="cfilter-wrap" hidden>Show
+    <select id="cfilter">
+      <option value="all">all contacts</option>
+      <option value="live">on the phone</option>
+      <option value="deleted">deleted from the phone</option>
     </select>
   </label>
   <input id="search" type="search" placeholder="Search name, number or message…" autocomplete="off">
@@ -119,6 +167,9 @@ const listEl = document.getElementById('list');
 const threadEl = document.getElementById('thread');
 const searchEl = document.getElementById('search');
 const scopeEl = document.getElementById('scope');
+const cfilterEl = document.getElementById('cfilter');
+
+let mode = 'messages';     // 'messages' or 'contacts'
 
 let since = 0;             // window floor in epoch ms; 0 is the whole history
 let convLoaded = 0;        // conversations currently in the list
@@ -220,13 +271,14 @@ function convQuery(offset) {
 
 async function loadConversations() {
   const convs = await api(convQuery(0)) || [];
+  if (mode !== 'messages') return; // the tab changed while loading
   convLoaded = convs.length;
   convDone = convs.length < CONV_PAGE;
   renderConvList(convs);
 }
 
 async function appendConversations() {
-  if (convDone || convLoading || searchEl.value.trim()) return;
+  if (mode !== 'messages' || convDone || convLoading || searchEl.value.trim()) return;
   convLoading = true;
   try {
     const convs = await api(convQuery(convLoaded)) || [];
@@ -270,9 +322,17 @@ listEl.addEventListener('scroll', () => {
 
 function bubbleEl(m) {
   const div = document.createElement('div');
-  div.className = 'bubble ' + (m.received ? 'in' : 'out');
-  div.innerHTML = esc(m.body) + '<span class="ts">' + esc(fmtDate(m.date)) + '</span>';
+  div.className = 'bubble ' + (m.received ? 'in' : 'out') + (m.deleted_at ? ' deleted' : '');
+  div.innerHTML = esc(m.body) + '<span class="ts">' + esc(fmtDate(m.date)) + deletedNote(m) + '</span>';
   return div;
+}
+
+// deleted_at is when smsd noticed, not when the phone deleted it, hence the
+// wording.
+function deletedNote(m) {
+  return m.deleted_at
+    ? ' · <span title="noticed ' + esc(fmtDate(m.deleted_at)) + '">deleted from phone</span>'
+    : '';
 }
 
 function threadTitle(address) {
@@ -280,22 +340,26 @@ function threadTitle(address) {
   return (row && row.dataset.title) || address;
 }
 
-async function openThread(address) {
+// opts.title names a thread that may not be in the list, and opts.all ignores
+// the window — both for threads opened from a contact card.
+async function openThread(address, opts = {}) {
   active = address;
   for (const el of listEl.querySelectorAll('.conv')) {
     el.classList.toggle('active', el.dataset.address === address);
   }
 
+  const floor = opts.all ? 0 : since;
   const page = await api('/api/messages?address=' + encodeURIComponent(address) +
-    '&since=' + since + '&limit=' + MSG_PAGE);
+    '&since=' + floor + '&limit=' + MSG_PAGE);
   const msgs = page.messages || [];
   // thread.since mirrors the window until the reader asks for older messages,
   // at which point it drops to 0 for this thread only.
-  thread = { address, since, hasMore: page.has_more, oldest: msgs[0] || null };
+  thread = { address, since: floor, hasMore: page.has_more, oldest: msgs[0] || null,
+    title: opts.title };
 
   threadEl.replaceChildren();
   const h2 = document.createElement('h2');
-  h2.textContent = threadTitle(address);
+  h2.textContent = opts.title || threadTitle(address);
   threadEl.appendChild(h2);
 
   const more = document.createElement('button');
@@ -369,6 +433,7 @@ async function loadOlder() {
 let searchTimer = null;
 searchEl.addEventListener('input', () => {
   clearTimeout(searchTimer);
+  if (mode === 'contacts') { renderContactList(); return; }
   const q = searchEl.value.trim();
   searchTimer = setTimeout(() => q ? runSearch(q) : loadConversations(), 200);
 });
@@ -382,22 +447,156 @@ async function runSearch(q) {
   let html = '<h2>' + hits.length + ' result' + (hits.length === 1 ? '' : 's') + ' for “' + esc(q) + '”</h2>';
   if (hits.length === 0) html += '<div class="empty">No matches</div>';
   for (const m of hits) {
-    html += '<div class="bubble ' + (m.received ? 'in' : 'out') + ' searchhit">' +
-      '<div class="addr">' + esc(m.address) + ' · ' + esc(fmtDate(m.date)) + '</div>' +
+    html += '<div class="bubble ' + (m.received ? 'in' : 'out') + (m.deleted_at ? ' deleted' : '') + ' searchhit">' +
+      '<div class="addr">' + esc(m.address) + ' · ' + esc(fmtDate(m.date)) + deletedNote(m) + '</div>' +
       esc(m.body) + '</div>';
   }
   threadEl.innerHTML = html;
   threadEl.scrollTop = 0;
 }
 
+/* ---------- contacts ---------- */
+
+// A phone book is a few hundred entries, so the whole list is fetched when the
+// tab opens and filtered here rather than paged from the server.
+const KIND_TITLES = {
+  phone: 'Phone', email: 'Email', address: 'Address', organization: 'Organization',
+  website: 'Website', event: 'Date', nickname: 'Nickname', note: 'Note',
+};
+
+let contacts = [];         // /api/contacts, everything including deleted
+let activeContact = null;  // id of the open card
+
+async function loadContacts() {
+  contacts = await api('/api/contacts') || [];
+  if (mode === 'contacts') renderContactList();
+}
+
+function contactTitle(c) {
+  return c.name || c.phone || '(no name)';
+}
+
+function renderContactList() {
+  const q = searchEl.value.trim().toLowerCase();
+  const digits = q.replace(/\D/g, '');
+  const filter = cfilterEl.value;
+  const shown = contacts.filter(c =>
+    (filter === 'all' || (filter === 'deleted') === Boolean(c.deleted_at)) &&
+    (!q || c.name.toLowerCase().includes(q) ||
+      (digits && c.phone.replace(/\D/g, '').includes(digits))));
+
+  const frag = document.createDocumentFragment();
+  for (const c of shown) {
+    const div = document.createElement('div');
+    div.className = 'conv' + (c.deleted_at ? ' deleted' : '') + (c.id === activeContact ? ' active' : '');
+    div.dataset.contact = c.id;
+    div.innerHTML =
+      '<div class="name">' + esc(contactTitle(c)) + (c.starred ? '<span class="star">★</span>' : '') +
+      (c.deleted_at ? '<span class="gone">DELETED</span>' : '') + '</div>' +
+      (c.name && c.phone ? '<div class="meta">' + esc(c.phone) + '</div>' : '');
+    div.onclick = () => openContact(c.id);
+    frag.appendChild(div);
+  }
+  const foot = document.createElement('div');
+  foot.className = 'listend';
+  const gone = contacts.filter(c => c.deleted_at).length;
+  foot.textContent = shown.length + ' of ' + contacts.length + ' contacts' +
+    (gone ? ' · ' + gone + ' deleted from the phone' : '');
+  frag.appendChild(foot);
+  listEl.replaceChildren(frag);
+}
+
+async function openContact(id) {
+  activeContact = id;
+  for (const el of listEl.querySelectorAll('.conv')) {
+    el.classList.toggle('active', Number(el.dataset.contact) === id);
+  }
+  const c = await api('/api/contact?id=' + id);
+
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = '<h2>' + esc(contactTitle(c)) + (c.starred ? '<span class="star">★</span>' : '') +
+    (c.deleted_at ? '<span class="gone">DELETED</span>' : '') + '</h2>' +
+    (c.deleted_at ? '<div class="banner">Deleted from the phone · noticed ' + esc(fmtDate(c.deleted_at)) + '</div>' : '');
+
+  let kind = null;
+  for (const d of c.details) {
+    if (d.kind !== kind) {
+      kind = d.kind;
+      card.appendChild(Object.assign(document.createElement('h3'), { textContent: KIND_TITLES[kind] || kind }));
+    }
+    const row = document.createElement('div');
+    row.className = 'field' + (d.deleted_at ? ' deleted' : '');
+    row.innerHTML = '<span class="label">' + esc(d.label) + '</span>' +
+      '<span class="value">' + detailValue(d) + '</span>' +
+      (d.deleted_at ? '<span class="gone" title="noticed ' + esc(fmtDate(d.deleted_at)) + '">REMOVED</span>' : '');
+    if (d.conversation) {
+      const btn = document.createElement('button');
+      btn.textContent = 'Messages →';
+      btn.onclick = () => showConversation(d.conversation, contactTitle(c));
+      row.appendChild(btn);
+    }
+    card.appendChild(row);
+  }
+  if (c.details.length === 0) {
+    card.appendChild(Object.assign(document.createElement('div'), { className: 'empty', textContent: 'No details' }));
+  }
+  threadEl.replaceChildren(card);
+  threadEl.scrollTop = 0;
+}
+
+// Values are shown as text; only e-mail and plain http(s) links become links,
+// so nothing stored on the phone can smuggle in a javascript: URL.
+function detailValue(d) {
+  const v = esc(d.value);
+  if (d.kind === 'email') return '<a href="mailto:' + v + '">' + v + '</a>';
+  if (d.kind === 'website' && /^https?:\/\//i.test(d.value)) {
+    return '<a href="' + v + '" target="_blank" rel="noopener noreferrer">' + v + '</a>';
+  }
+  return v;
+}
+
+async function showConversation(address, title) {
+  await setMode('messages');
+  await openThread(address, { title, all: true });
+}
+
+/* ---------- mode ---------- */
+
+const tabs = { messages: document.getElementById('tab-messages'), contacts: document.getElementById('tab-contacts') };
+
+async function setMode(m) {
+  if (m === mode) return;
+  mode = m;
+  for (const [k, el] of Object.entries(tabs)) el.classList.toggle('on', k === m);
+  document.getElementById('scope-wrap').hidden = m !== 'messages';
+  document.getElementById('cfilter-wrap').hidden = m !== 'contacts';
+  searchEl.value = '';
+  searchEl.placeholder = m === 'messages' ? 'Search name, number or message…' : 'Search name or number…';
+  active = null;
+  thread = null;
+  activeContact = null;
+  threadEl.replaceChildren(Object.assign(document.createElement('div'),
+    { className: 'empty', textContent: m === 'messages' ? 'Select a conversation' : 'Select a contact' }));
+  listEl.scrollTop = 0;
+  if (m === 'messages') await loadConversations(); else await loadContacts();
+}
+tabs.messages.onclick = () => setMode('messages');
+tabs.contacts.onclick = () => setMode('contacts');
+
+cfilterEl.addEventListener('change', () => {
+  localStorage.setItem('smsd.cfilter', cfilterEl.value);
+  renderContactList();
+});
+
 /* ---------- refresh ---------- */
 
 // Polling a fingerprint instead of the whole list means an idle viewer does no
 // rendering work at all, and a busy one only redraws once per actual change.
 async function poll() {
-  if (searchEl.value.trim()) return;
+  if (mode !== 'messages' || searchEl.value.trim()) return;
   const s = await api('/api/state');
-  const token = s.count + ':' + s.max_id;
+  const token = s.count + ':' + s.max_id + ':' + s.deleted;
   if (token === lastToken) return;
   const first = lastToken === null;
   lastToken = token;
@@ -407,12 +606,14 @@ async function poll() {
   // Only pull new messages into an open thread when the reader is already at
   // the bottom; otherwise a refresh would yank them away from what they read.
   if (thread && threadEl.scrollTop + threadEl.clientHeight >= threadEl.scrollHeight - 40) {
-    await openThread(thread.address);
+    await openThread(thread.address, { title: thread.title, all: thread.since === 0 && since > 0 });
   }
 }
 
 const saved = localStorage.getItem('smsd.scope');
 if (saved !== null && [...scopeEl.options].some(o => o.value === saved)) scopeEl.value = saved;
+const savedFilter = localStorage.getItem('smsd.cfilter');
+if (savedFilter !== null && [...cfilterEl.options].some(o => o.value === savedFilter)) cfilterEl.value = savedFilter;
 applyScope();
 loadConversations().then(poll);
 setInterval(() => poll().catch(() => {}), 5000);

@@ -69,6 +69,8 @@ func (s *Server) start() (string, error) {
 	mux.HandleFunc("/api/conversations", s.handleConversations)
 	mux.HandleFunc("/api/messages", s.handleMessages)
 	mux.HandleFunc("/api/search", s.handleSearch)
+	mux.HandleFunc("/api/contacts", s.handleContacts)
+	mux.HandleFunc("/api/contact", s.handleContact)
 
 	s.srv = &http.Server{
 		Handler:           mux,
@@ -180,6 +182,27 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	msgs, err := s.db.Search(q)
 	s.writeJSON(w, msgs, err)
+}
+
+// handleContacts lists every contact, deleted ones included; there are few
+// enough that the viewer filters them itself.
+func (s *Server) handleContacts(w http.ResponseWriter, r *http.Request) {
+	contacts, err := s.db.Contacts()
+	s.writeJSON(w, contacts, err)
+}
+
+func (s *Server) handleContact(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.URL.Query().Get("id"), 10, 64)
+	if err != nil {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+	card, ok, err := s.db.Contact(id)
+	if err == nil && !ok {
+		http.NotFound(w, r)
+		return
+	}
+	s.writeJSON(w, card, err)
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, v any, err error) {

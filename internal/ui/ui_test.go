@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/jbinder/smsd/internal/contact"
 	"github.com/jbinder/smsd/internal/database"
 	"github.com/jbinder/smsd/internal/logging"
 	"github.com/jbinder/smsd/internal/sms"
@@ -49,6 +50,8 @@ func newTestServer(t *testing.T, n int) (*httptest.Server, *database.DB) {
 	mux.HandleFunc("/api/state", s.handleState)
 	mux.HandleFunc("/api/conversations", s.handleConversations)
 	mux.HandleFunc("/api/messages", s.handleMessages)
+	mux.HandleFunc("/api/contacts", s.handleContacts)
+	mux.HandleFunc("/api/contact", s.handleContact)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, db
@@ -197,5 +200,42 @@ func TestMessagesEndpointEscapedAddress(t *testing.T) {
 	getJSON(t, srv, "/api/messages?address="+url.QueryEscape(weird), &page)
 	if len(page.Messages) != 1 || page.Messages[0].Address != weird {
 		t.Errorf("got %+v, want the one message for %q", page.Messages, weird)
+	}
+}
+
+func TestContactEndpoints(t *testing.T) {
+	srv, db := newTestServer(t, 1)
+	if _, err := db.SyncContacts("dev1",
+		[]contact.Contact{{AndroidID: 1, Name: "Ada"}},
+		[]contact.Detail{{AndroidID: 10, ContactID: 1, Kind: contact.KindPhone, Value: "555-123-4567"}},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var list []database.ContactSummary
+	getJSON(t, srv, "/api/contacts", &list)
+	if len(list) != 1 || list[0].Name != "Ada" || list[0].Phone != "555-123-4567" {
+		t.Fatalf("contacts = %+v", list)
+	}
+
+	var card database.ContactCard
+	getJSON(t, srv, "/api/contact?id="+strconv.FormatInt(list[0].ID, 10), &card)
+	if card.Name != "Ada" || len(card.Details) != 1 || card.Details[0].Conversation != "+15551234567" {
+		t.Errorf("card = %+v, want Ada linked to the test conversation", card)
+	}
+
+	for path, want := range map[string]int{
+		"/api/contact":         http.StatusBadRequest,
+		"/api/contact?id=x":    http.StatusBadRequest,
+		"/api/contact?id=9999": http.StatusNotFound,
+	} {
+		resp, err := srv.Client().Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("GET %s = %d, want %d", path, resp.StatusCode, want)
+		}
 	}
 }

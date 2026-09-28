@@ -11,11 +11,15 @@ installed on the phone.
 - Connects automatically whenever a phone is plugged in; disconnects are handled
   gracefully without crashing.
 - Imports SMS into SQLite, never duplicating a message.
+- Mirrors the phone's contacts — names, numbers, e-mail and postal addresses,
+  organisation, websites, dates, nicknames and notes.
+- **Never deletes anything.** A message or contact deleted on the phone (or
+  removed by a sync from elsewhere) stays in the database and is marked as
+  deleted; if it comes back, the mark is cleared.
 - Notifies (via libnotify) only for **newly received** messages — the first
   import of a phone's history is silent.
-- Caches contacts from the Android Contacts Provider so conversations show names.
-- Read-only conversation viewer in your browser, with search by phone number,
-  contact name, or message body.
+- Read-only viewer in your browser: conversations with search by phone number,
+  contact name, or message body, and a Contacts tab with each contact's card.
 - System tray icon — an SMS speech bubble in four states: hollow grey when no
   device is attached, filled green when connected, blue on unread messages, and
   red with an exclamation mark on error. Its menu offers Open SMS History,
@@ -31,6 +35,15 @@ smsd does **not** re-read the whole SMS table every couple of seconds. It:
    (`content query ... --where '_id>N'`). Steady-state polling transfers only the
    handful of new messages, so it stays fast and light even with tens of
    thousands of stored messages.
+
+Deletions cannot be seen in that incremental stream, so every
+`deleted_check_minutes` smsd also lists the ids of all messages on the phone
+(ids only — no bodies, a couple of seconds for ~17k messages) and marks stored
+messages that are no longer there. Contacts are small enough to be re-read in
+full every `contacts_refresh_minutes`.
+
+An empty answer from the phone is never taken to mean "everything was
+deleted" — that sync is skipped and logged instead.
 
 Goroutines are used with per-device `context` cancellation and ticker-based
 waits — there is no busy-waiting.
@@ -186,6 +199,7 @@ systemctl --user daemon-reload
   "device_poll_seconds": 2,
   "sms_poll_seconds": 2,
   "contacts_refresh_minutes": 15,
+  "deleted_check_minutes": 15,
   "notify_enabled": true,
   "notify_timeout_seconds": 30,
   "ui_addr": "127.0.0.1:0",
@@ -195,6 +209,8 @@ systemctl --user daemon-reload
 
 - `adb_path` — override the `adb` binary; empty means look it up on `PATH`.
 - `ui_addr` — loopback bind address for the viewer; port `0` picks a free port.
+- `contacts_refresh_minutes` — how often contacts are re-synced.
+- `deleted_check_minutes` — how often the phone is checked for deleted messages.
 - `notify_timeout_seconds` — how long a notification stays on screen. Use a
   negative value to keep it up until dismissed. Your notification daemon has
   the last word: dunst honours the hint (unless overridden by a rule), GNOME
@@ -214,6 +230,26 @@ honours `$BROWSER` and your XDG default. Notes:
 - The first launch after login can be slow if your browser is not already
   running; the browser is launched fire-and-forget, so a failed launch is silent.
 - The server binds to loopback only and is read-only.
+
+### Contacts and deletions
+
+The **Contacts** tab lists every contact smsd has seen, with a filter for all
+contacts, those on the phone, or those deleted from it. A contact's card shows
+its details grouped by kind; numbers you have exchanged SMS with get a
+**Messages →** button that opens that conversation across its whole history.
+The same number held by several accounts on the phone (Google, a messenger, …)
+is shown once.
+
+Deleted contacts, details and messages are shown with a *deleted* marker. The
+date given is when smsd noticed, which can be later than the actual deletion
+if the phone was not connected at the time. A deleted contact still names its
+old conversations, but a contact still on the phone wins if both have the
+number. Edits made on the phone — a renamed contact, a corrected number —
+update the stored copy in place.
+
+Databases from earlier versions, which only cached number → name pairs, are
+upgraded on the first contact sync of each phone: numbers no longer on the
+phone become deleted contacts rather than being dropped.
 
 ### Time window
 
@@ -247,7 +283,12 @@ curl "$URL/api/state"
 curl "$URL/api/conversations?since=1780000000000&limit=100&offset=0"
 curl "$URL/api/messages?address=%2B15551234567&since=1780000000000&limit=200"
 curl "$URL/api/messages?address=%2B15551234567&before_date=…&before_id=…"
+curl "$URL/api/contacts"
+curl "$URL/api/contact?id=42"
 ```
+
+Messages, contacts and contact details carry `deleted_at` (millisecond epoch)
+once they have been marked deleted; the field is absent otherwise.
 
 `has_more` in the `/api/messages` response reports whether older messages remain
 *inside the requested window*; drop `since` from the next request to read past it.
@@ -259,7 +300,8 @@ cmd/smsd            entry point, signal handling, wiring
 internal/config     XDG paths + JSON config
 internal/logging    rotating file logger (log.txt)
 internal/sms        SMS model + content-query parser  (unit-tested)
-internal/database   SQLite schema, dedup import, contacts, search  (unit-tested)
+internal/contact    contact model + content-query parser  (unit-tested)
+internal/database   SQLite schema, dedup import, contacts, deletion marks, search  (unit-tested)
 internal/adb        adb client: server, devices, sms/contacts queries
 internal/notify     libnotify (notify-send) notifications
 internal/tray       StatusNotifierItem tray + generated state icons
@@ -273,7 +315,8 @@ touching the tray, notifier, or viewer.
 
 ## Limitations
 
-- Read-only: smsd never sends or deletes messages on the phone.
+- Read-only: smsd never sends or deletes messages on the phone, and never
+  writes to its contacts.
 - SMS only (no MMS/RCS yet).
 - Requires the phone unlocked and USB debugging authorised for the host.
 

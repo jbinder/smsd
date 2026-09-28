@@ -1,6 +1,7 @@
 // Package database owns the local SQLite store: schema, deduplicated SMS
-// import, the contact cache and the read-only queries the viewer uses. It uses
-// the pure-Go modernc.org/sqlite driver so the binary needs no cgo.
+// import, contacts, deletion tracking and the read-only queries the viewer
+// uses. It uses the pure-Go modernc.org/sqlite driver so the binary needs no
+// cgo.
 package database
 
 import (
@@ -17,12 +18,6 @@ import (
 // DB wraps the SQLite connection and the smsd schema.
 type DB struct {
 	db *sql.DB
-}
-
-// Contact is a cached entry from the Android Contacts Provider.
-type Contact struct {
-	Phone string
-	Name  string
 }
 
 // Open opens (creating if needed) the SQLite database at path and applies the
@@ -77,22 +72,36 @@ CREATE INDEX IF NOT EXISTS idx_messages_addr_date ON messages(address, date);
 DROP INDEX IF EXISTS idx_messages_address;
 CREATE INDEX IF NOT EXISTS idx_messages_thread  ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_date    ON messages(date);
-
-CREATE TABLE IF NOT EXISTS contacts (
-	id          INTEGER PRIMARY KEY AUTOINCREMENT,
-	device      TEXT NOT NULL,
-	phone       TEXT NOT NULL,
-	normalized  TEXT NOT NULL,
-	name        TEXT NOT NULL DEFAULT '',
-	UNIQUE(device, normalized)
-);
-CREATE INDEX IF NOT EXISTS idx_contacts_norm ON contacts(normalized);
 `
-	_, err := d.db.Exec(schema)
+	if _, err := d.db.Exec(schema); err != nil {
+		return fmt.Errorf("migrating schema: %w", err)
+	}
+
+	// Nothing is ever deleted from the store. A message that disappears from
+	// the phone keeps its row and gets deleted_at, the time smsd noticed.
+	hasDeleted, err := d.hasColumn("messages", "deleted_at")
 	if err != nil {
 		return fmt.Errorf("migrating schema: %w", err)
 	}
+	if !hasDeleted {
+		if _, err := d.db.Exec(`ALTER TABLE messages ADD COLUMN deleted_at INTEGER`); err != nil {
+			return fmt.Errorf("adding messages.deleted_at: %w", err)
+		}
+	}
+
+	if err := d.migrateContacts(); err != nil {
+		return fmt.Errorf("migrating contacts: %w", err)
+	}
 	return nil
+}
+
+// hasColumn reports whether table has a column called name.
+func (d *DB) hasColumn(table, name string) (bool, error) {
+	var n int
+	err := d.db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, name,
+	).Scan(&n)
+	return n > 0, err
 }
 
 // MaxAndroidID returns the highest device _id already imported for a device, or
@@ -196,39 +205,6 @@ func (d *DB) MarkAllNotified() error {
 	return err
 }
 
-// UpsertContacts refreshes the contact cache for a device, inserting new
-// numbers and updating names for existing ones.
-func (d *DB) UpsertContacts(device string, contacts []Contact) error {
-	if len(contacts) == 0 {
-		return nil
-	}
-	tx, err := d.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.Prepare(`
-		INSERT INTO contacts (device, phone, normalized, name)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT(device, normalized) DO UPDATE SET name = excluded.name, phone = excluded.phone`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	for _, c := range contacts {
-		norm := NormalizePhone(c.Phone)
-		if norm == "" {
-			continue
-		}
-		if _, err := stmt.Exec(device, c.Phone, norm, c.Name); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
 // NormalizePhone reduces a phone number to comparable digits, keeping only the
 // last 10 significant digits so that "+1 (555) 123-4567" and "555-123-4567"
 // resolve to the same contact.
@@ -244,22 +220,6 @@ func NormalizePhone(s string) string {
 		digits = digits[len(digits)-10:]
 	}
 	return digits
-}
-
-// ContactName returns the cached contact name for an address, or "" if unknown.
-func (d *DB) ContactName(address string) (string, error) {
-	norm := NormalizePhone(address)
-	if norm == "" {
-		return "", nil
-	}
-	var name string
-	err := d.db.QueryRow(
-		`SELECT name FROM contacts WHERE normalized = ? AND name <> '' LIMIT 1`, norm,
-	).Scan(&name)
-	if err == sql.ErrNoRows {
-		return "", nil
-	}
-	return name, err
 }
 
 // Conversation summarises a thread of messages with one counterparty.
@@ -324,25 +284,6 @@ func (d *DB) Conversations(since int64, limit, offset int) ([]Conversation, erro
 	return out, rows.Err()
 }
 
-// contactNames maps a normalised phone number to its cached contact name.
-func (d *DB) contactNames() (map[string]string, error) {
-	rows, err := d.db.Query(`SELECT normalized, name FROM contacts WHERE name <> ''`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	names := map[string]string{}
-	for rows.Next() {
-		var norm, name string
-		if err := rows.Scan(&norm, &name); err != nil {
-			return nil, err
-		}
-		names[norm] = name
-	}
-	return names, rows.Err()
-}
-
 // StoredMessage is a message as returned to the viewer.
 type StoredMessage struct {
 	AndroidID int64  `json:"android_id"`
@@ -351,6 +292,9 @@ type StoredMessage struct {
 	Date      int64  `json:"date"`
 	Type      int    `json:"type"`
 	Received  bool   `json:"received"`
+	// DeletedAt is when smsd noticed the message had gone from the phone, in
+	// epoch milliseconds; zero while it is still there.
+	DeletedAt int64 `json:"deleted_at,omitempty"`
 }
 
 // Cursor identifies the oldest message a caller already holds. The zero Cursor
@@ -388,7 +332,7 @@ func (d *DB) Messages(address string, since int64, cur Cursor, limit int) (Messa
 	args = append(args, limit+1)
 
 	rows, err := d.db.Query(`
-		SELECT android_id, address, body, date, type
+		SELECT android_id, address, body, date, type, COALESCE(deleted_at, 0)
 		FROM messages WHERE address = ? AND date >= ?`+where+`
 		ORDER BY date DESC, android_id DESC
 		LIMIT ?`, args...)
@@ -418,15 +362,111 @@ func (d *DB) Messages(address string, since int64, cur Cursor, limit int) (Messa
 // State is a cheap fingerprint of the message table. The viewer polls it and
 // only re-renders when it changes, which keeps an idle window quiet.
 type State struct {
-	Count int64 `json:"count"`
-	MaxID int64 `json:"max_id"`
+	Count   int64 `json:"count"`
+	MaxID   int64 `json:"max_id"`
+	Deleted int64 `json:"deleted"`
 }
 
-// State returns the current message count and highest row id.
+// State returns the current message count, highest row id and the number of
+// messages marked deleted.
 func (d *DB) State() (State, error) {
 	var s State
-	err := d.db.QueryRow(`SELECT COUNT(*), COALESCE(MAX(id), 0) FROM messages`).Scan(&s.Count, &s.MaxID)
+	err := d.db.QueryRow(
+		`SELECT COUNT(*), COALESCE(MAX(id), 0), COUNT(deleted_at) FROM messages`,
+	).Scan(&s.Count, &s.MaxID, &s.Deleted)
 	return s, err
+}
+
+// SyncResult counts what a reconciliation against the phone changed.
+type SyncResult struct {
+	Added    int // new rows
+	Removed  int // rows newly marked deleted
+	Restored int // rows marked deleted that are back on the phone
+}
+
+// String summarises the non-zero counts, e.g. " (2 new, 1 deleted on phone)".
+func (r SyncResult) String() string {
+	var parts []string
+	if r.Added > 0 {
+		parts = append(parts, fmt.Sprintf("%d new", r.Added))
+	}
+	if r.Removed > 0 {
+		parts = append(parts, fmt.Sprintf("%d deleted on phone", r.Removed))
+	}
+	if r.Restored > 0 {
+		parts = append(parts, fmt.Sprintf("%d back on phone", r.Restored))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
+}
+
+// ReconcileMessages compares the ids currently on the phone with those stored
+// for device. Stored messages missing from the phone are marked deleted — never
+// removed — and a marked message that reappears is unmarked. Ids not stored yet
+// are left to the regular import.
+func (d *DB) ReconcileMessages(device string, onPhone []int64) (SyncResult, error) {
+	seen := make(map[int64]bool, len(onPhone))
+	for _, id := range onPhone {
+		seen[id] = true
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return SyncResult{}, err
+	}
+	defer tx.Rollback()
+
+	var res SyncResult
+	if err := markDeleted(tx, "messages", device, seen, time.Now().UnixMilli(), &res); err != nil {
+		return res, err
+	}
+	return res, tx.Commit()
+}
+
+// markDeleted brings the deleted_at marks of device's rows in table in line
+// with seen, the android ids currently on the phone.
+func markDeleted(tx *sql.Tx, table, device string, seen map[int64]bool, now int64, res *SyncResult) error {
+	rows, err := tx.Query(
+		`SELECT android_id, deleted_at IS NOT NULL FROM `+table+` WHERE device = ?`, device)
+	if err != nil {
+		return err
+	}
+	var gone, back []int64
+	for rows.Next() {
+		var id int64
+		var deleted bool
+		if err := rows.Scan(&id, &deleted); err != nil {
+			rows.Close()
+			return err
+		}
+		switch {
+		case !seen[id] && !deleted:
+			gone = append(gone, id)
+		case seen[id] && deleted:
+			back = append(back, id)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, id := range gone {
+		if _, err := tx.Exec(`UPDATE `+table+` SET deleted_at = ? WHERE device = ? AND android_id = ?`,
+			now, device, id); err != nil {
+			return err
+		}
+	}
+	for _, id := range back {
+		if _, err := tx.Exec(`UPDATE `+table+` SET deleted_at = NULL WHERE device = ? AND android_id = ?`,
+			device, id); err != nil {
+			return err
+		}
+	}
+	res.Removed += len(gone)
+	res.Restored += len(back)
+	return nil
 }
 
 // Search finds messages whose body, address or resolved contact name matches
@@ -436,13 +476,15 @@ func (d *DB) Search(query string) ([]StoredMessage, error) {
 	norm := NormalizePhone(query)
 	normLike := "%" + norm + "%"
 	rows, err := d.db.Query(`
-		SELECT DISTINCT m.android_id, m.address, m.body, m.date, m.type
+		SELECT m.android_id, m.address, m.body, m.date, m.type, COALESCE(m.deleted_at, 0)
 		FROM messages m
-		LEFT JOIN contacts c ON c.normalized = `+normalizeSQL("m.address")+`
 		WHERE lower(m.body) LIKE ?
 		   OR lower(m.address) LIKE ?
 		   OR (? <> '' AND m.address LIKE ?)
-		   OR lower(c.name) LIKE ?
+		   OR `+normalizeSQL("m.address")+` IN (
+				SELECT d.normalized FROM contact_details d
+				JOIN contacts c ON c.device = d.device AND c.android_id = d.contact_id
+				WHERE d.kind = 'phone' AND lower(c.name) LIKE ?)
 		ORDER BY m.date DESC
 		LIMIT 500`, q, q, norm, normLike, q)
 	if err != nil {
@@ -456,7 +498,7 @@ func scanMessages(rows *sql.Rows) ([]StoredMessage, error) {
 	var out []StoredMessage
 	for rows.Next() {
 		var m StoredMessage
-		if err := rows.Scan(&m.AndroidID, &m.Address, &m.Body, &m.Date, &m.Type); err != nil {
+		if err := rows.Scan(&m.AndroidID, &m.Address, &m.Body, &m.Date, &m.Type, &m.DeletedAt); err != nil {
 			return nil, err
 		}
 		m.Received = m.Type == sms.TypeReceived

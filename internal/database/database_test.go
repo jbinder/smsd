@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jbinder/smsd/internal/contact"
 	"github.com/jbinder/smsd/internal/sms"
 )
 
@@ -151,9 +152,10 @@ func TestContactsAndSearch(t *testing.T) {
 	}, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.UpsertContacts("dev1", []Contact{
-		{Phone: "(555) 123-4567", Name: "Alice Example"},
-	}); err != nil {
+	if _, err := db.SyncContacts("dev1",
+		[]contact.Contact{{AndroidID: 1, Name: "Alice Example"}},
+		[]contact.Detail{{AndroidID: 1, ContactID: 1, Kind: contact.KindPhone, Value: "(555) 123-4567"}},
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -242,7 +244,10 @@ func TestConversationsPaging(t *testing.T) {
 // still match across differing phone-number formatting.
 func TestConversationsResolveContactName(t *testing.T) {
 	db := openTestDB(t)
-	if err := db.UpsertContacts("dev1", []Contact{{Phone: "555-123-4567", Name: "Ada"}}); err != nil {
+	if _, err := db.SyncContacts("dev1",
+		[]contact.Contact{{AndroidID: 1, Name: "Ada"}},
+		[]contact.Detail{{AndroidID: 1, ContactID: 1, Kind: contact.KindPhone, Value: "555-123-4567"}},
+	); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ImportMessages("dev1", []sms.Message{

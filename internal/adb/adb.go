@@ -10,11 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"regexp"
 	"strings"
 	"time"
 
-	"github.com/jbinder/smsd/internal/database"
+	"github.com/jbinder/smsd/internal/contact"
 	"github.com/jbinder/smsd/internal/sms"
 )
 
@@ -130,67 +129,39 @@ func (c *Client) QuerySMS(ctx context.Context, serial string, sinceID int64) ([]
 	return sms.ParseQueryOutput(out), nil
 }
 
-// contactRow matches "Row: N " prefixes in contacts output.
-var contactRow = regexp.MustCompile(`(?m)^Row: \d+ `)
-
-// QueryContacts reads name/number pairs from the Contacts Provider. The number
-// (data1) is projected first so the free-text display_name can safely contain
-// commas as the trailing field.
-func (c *Client) QueryContacts(ctx context.Context, serial string) ([]database.Contact, error) {
-	const remote = "content query --uri content://com.android.contacts/data/phones " +
-		"--projection data1:display_name"
-	out, err := c.run(ctx, "-s", serial, "shell", remote)
+// QuerySMSIDs lists the _id of every message on the device. It is the cheap
+// half of noticing deletions: comparing it with the stored ids shows which
+// messages are gone from the phone without transferring any bodies.
+func (c *Client) QuerySMSIDs(ctx context.Context, serial string) ([]int64, error) {
+	out, err := c.run(ctx, "-s", serial, "shell", "content query --uri content://sms --projection _id")
 	if err != nil {
 		return nil, err
 	}
-	return parseContacts(out), nil
+	msgs := sms.ParseQueryOutput(out)
+	ids := make([]int64, len(msgs))
+	for i, m := range msgs {
+		ids[i] = m.AndroidID
+	}
+	return ids, nil
 }
 
-func parseContacts(out string) []database.Contact {
-	out = strings.TrimSpace(out)
-	if out == "" || strings.HasPrefix(out, "No result found") {
-		return nil
+// QueryContacts reads every contact and its details (numbers, e-mail
+// addresses, …) from the Contacts Provider. Both queries must succeed: a
+// partial read would make the missing half look deleted.
+func (c *Client) QueryContacts(ctx context.Context, serial string) ([]contact.Contact, []contact.Detail, error) {
+	out, err := c.run(ctx, "-s", serial, "shell",
+		"content query --uri content://com.android.contacts/contacts --projection "+
+			strings.Join(contact.ContactProjection, ":"))
+	if err != nil {
+		return nil, nil, err
 	}
-	var contacts []database.Contact
-	for _, chunk := range contactRow.Split(out, -1) {
-		chunk = strings.TrimRight(chunk, "\r\n")
-		if strings.TrimSpace(chunk) == "" {
-			continue
-		}
-		phone, name := parseContactChunk(chunk)
-		if phone == "" {
-			continue
-		}
-		contacts = append(contacts, database.Contact{Phone: phone, Name: name})
-	}
-	return contacts
-}
+	contacts := contact.ParseContacts(out)
 
-// parseContactChunk parses "data1=<number>, display_name=<name>".
-func parseContactChunk(chunk string) (phone, name string) {
-	const nameKey = "display_name="
-	if idx := strings.Index(chunk, nameKey); idx >= 0 {
-		name = strings.TrimSpace(chunk[idx+len(nameKey):])
-		head := strings.TrimRight(chunk[:idx], ", ")
-		phone = valueOf(head, "data1")
-	} else {
-		phone = valueOf(chunk, "data1")
+	out, err = c.run(ctx, "-s", serial, "shell",
+		"content query --uri content://com.android.contacts/data --projection "+
+			strings.Join(contact.DetailProjection, ":"))
+	if err != nil {
+		return nil, nil, err
 	}
-	if name == "NULL" {
-		name = ""
-	}
-	return strings.TrimSpace(phone), name
-}
-
-func valueOf(head, key string) string {
-	for _, part := range strings.Split(head, ", ") {
-		if strings.HasPrefix(part, key+"=") {
-			v := strings.TrimPrefix(part, key+"=")
-			if v == "NULL" {
-				return ""
-			}
-			return v
-		}
-	}
-	return ""
+	return contacts, contact.ParseDetails(out), nil
 }

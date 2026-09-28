@@ -147,9 +147,10 @@ func (a *App) startDevice(parent context.Context, serial string) {
 	}()
 }
 
-// syncDevice imports contacts once, backfills history on first sight, then
-// polls only for messages newer than the highest imported _id. It waits on a
-// ticker and a poke channel — never busy-waits.
+// syncDevice syncs contacts, backfills history on first sight, then polls only
+// for messages newer than the highest imported _id. Less often it re-syncs
+// contacts and checks for messages deleted from the phone. It waits on
+// tickers and a poke channel — never busy-waits.
 func (a *App) syncDevice(ctx context.Context, serial string, poke <-chan struct{}) {
 	// A device never imported before gets a silent historical backfill.
 	_, seen, err := a.db.MaxAndroidID(serial)
@@ -158,13 +159,16 @@ func (a *App) syncDevice(ctx context.Context, serial string, poke <-chan struct{
 	}
 	backfill := !seen
 
-	a.refreshContacts(ctx, serial)
+	a.syncContacts(ctx, serial)
 	a.pollOnce(ctx, serial, &backfill)
+	a.checkDeleted(ctx, serial)
 
 	smsTick := time.NewTicker(time.Duration(a.cfg.SMSPollSeconds) * time.Second)
 	defer smsTick.Stop()
 	contactsTick := time.NewTicker(time.Duration(a.cfg.ContactsRefreshMinutes) * time.Minute)
 	defer contactsTick.Stop()
+	deletedTick := time.NewTicker(time.Duration(a.cfg.DeletedCheckMinutes) * time.Minute)
+	defer deletedTick.Stop()
 
 	for {
 		select {
@@ -175,7 +179,9 @@ func (a *App) syncDevice(ctx context.Context, serial string, poke <-chan struct{
 		case <-poke:
 			a.pollOnce(ctx, serial, &backfill)
 		case <-contactsTick.C:
-			a.refreshContacts(ctx, serial)
+			a.syncContacts(ctx, serial)
+		case <-deletedTick.C:
+			a.checkDeleted(ctx, serial)
 		}
 	}
 }
@@ -250,21 +256,55 @@ func truncate(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
-// refreshContacts refreshes the contact cache for a device, logging but not
-// failing on error (contacts are best-effort).
-func (a *App) refreshContacts(ctx context.Context, serial string) {
-	contacts, err := a.adb.QueryContacts(ctx, serial)
+// syncContacts mirrors the device's contacts into the database, logging but
+// not failing on error (contacts are best-effort).
+func (a *App) syncContacts(ctx context.Context, serial string) {
+	contacts, details, err := a.adb.QueryContacts(ctx, serial)
 	if err != nil {
 		if ctx.Err() == nil {
 			a.log.Warnf("device %s: querying contacts: %v", serial, err)
 		}
 		return
 	}
-	if err := a.db.UpsertContacts(serial, contacts); err != nil {
-		a.log.Errorf("device %s: caching contacts: %v", serial, err)
+	// An empty read is far more likely a provider hiccup than a phone whose
+	// every contact was just deleted, and syncing it would mark them all
+	// deleted.
+	if len(contacts) == 0 {
+		a.log.Warnf("device %s: phone returned no contacts, skipping contact sync", serial)
 		return
 	}
-	a.log.Infof("device %s: cached %d contact(s)", serial, len(contacts))
+	res, err := a.db.SyncContacts(serial, contacts, details)
+	if err != nil {
+		a.log.Errorf("device %s: syncing contacts: %v", serial, err)
+		return
+	}
+	a.log.Infof("device %s: synced %d contact(s)%s", serial, len(contacts), res)
+}
+
+// checkDeleted marks stored messages that are no longer on the phone as
+// deleted. It lists every id on the device, so it runs far less often than
+// the incremental poll.
+func (a *App) checkDeleted(ctx context.Context, serial string) {
+	ids, err := a.adb.QuerySMSIDs(ctx, serial)
+	if err != nil {
+		if ctx.Err() == nil {
+			a.log.Warnf("device %s: listing sms ids: %v", serial, err)
+		}
+		return
+	}
+	// As with contacts, an empty listing is not trusted to mean "all deleted".
+	if len(ids) == 0 {
+		a.log.Warnf("device %s: phone returned no sms ids, skipping deletion check", serial)
+		return
+	}
+	res, err := a.db.ReconcileMessages(serial, ids)
+	if err != nil {
+		a.log.Errorf("device %s: checking for deleted messages: %v", serial, err)
+		return
+	}
+	if res.Removed > 0 || res.Restored > 0 {
+		a.log.Infof("device %s: messages%s", serial, res)
+	}
 }
 
 // --- tray state -----------------------------------------------------------
