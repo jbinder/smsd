@@ -31,12 +31,15 @@ installed on the phone.
   deleted; if it comes back, the mark is cleared.
 - Notifies (via libnotify) only for **newly received** messages — the first
   import of a phone's history is silent.
+- Mirrors the phone's **call log**, raises an **Incoming call** notification
+  while the phone rings and turns it into a **Missed call** alert if nobody
+  answers — see [Calls](#calls).
 - Viewer in your browser: conversations with search by phone number, contact
   name, or message body, and a Contacts tab with each contact's card.
 - Sends SMS from the viewer — replies and new messages — through the phone,
   still with no app installed on it.
 - System tray icon — an SMS speech bubble in four states: hollow grey when no
-  device is attached, filled green when connected, blue on unread messages, and
+  device is attached, filled green when connected, blue on unread messages or missed calls, and
   red with an exclamation mark on error. Its menu offers Open SMS History,
   Refresh, Mark notifications read, Reconnect and Quit.
 
@@ -54,7 +57,7 @@ smsd does **not** re-read the whole SMS table every couple of seconds. It:
 Deletions cannot be seen in that incremental stream, so every
 `deleted_check_minutes` smsd also lists the ids of all messages on the phone
 (ids only — no bodies, a couple of seconds for ~17k messages) and marks stored
-messages that are no longer there. Contacts are small enough to be re-read in
+messages that are no longer there (and likewise for the call log). Contacts are small enough to be re-read in
 full every `contacts_refresh_minutes`.
 
 An empty answer from the phone is never taken to mean "everything was
@@ -119,7 +122,8 @@ bridge.
    to smsd.
 
 No companion app is required. smsd only issues standard, non-root `content query`
-commands against `content://sms` and the contacts provider.
+commands against `content://sms`, the contacts provider and the call log, and
+reads the call state with `dumpsys telephony.registry`.
 
 ## Build & install
 
@@ -285,6 +289,37 @@ browser can make it POST to `127.0.0.1`. The send endpoint therefore requires a
 random per-run token that only the viewer page carries, a loopback `Host`
 (against DNS rebinding) and, when present, a loopback `Origin`.
 
+### Calls
+
+The **Calls** tab lists the phone's call log — incoming, outgoing, missed
+(in red), rejected and blocked calls with their duration — under the same
+*Show* window as the conversations. Selecting a call shows every call with that
+number, plus **Messages →** or **Write SMS →**. Calls cleared from the phone's
+log are kept and marked deleted, like messages.
+
+Alerts, all through libnotify and subject to `notify_enabled`:
+
+- **Incoming call** — shown while the phone rings, with the contact name when
+  the number is known, and kept on screen until the ringing stops. Answering
+  removes it.
+- **Missed call** — an unanswered call replaces the incoming-call notification
+  with a missed-call alert, which uses `notify_timeout_seconds` like an SMS.
+  Missed calls also turn the tray icon blue until **Mark notifications read**.
+  Missed calls that happened while the phone was unplugged are alerted on when
+  it reconnects (with their time); the first import of a phone's call log is
+  silent. Rejected calls are not alerted on.
+
+How it works, still with no app on the phone: every poll, smsd reads the
+phone's call state from `dumpsys telephony.registry` (a tenth of a second,
+filtered on the phone to three lines per SIM). When a call ends it reads the
+call log (`content://call_log/calls`, newer ids only) for the next few polls;
+otherwise the log is re-read once a minute, which catches calls too short to be
+seen ringing. Dual-SIM phones are covered. Alerts lag the phone by up to
+`sms_poll_seconds`.
+
+Closing the incoming-call notification uses `gdbus` (part of glib2); without
+it the notification is replaced by one that expires at once.
+
 ### Contacts and deletions
 
 The **Contacts** tab lists every contact smsd has seen, with a filter for all
@@ -339,6 +374,9 @@ curl "$URL/api/messages?address=%2B15551234567&since=1780000000000&limit=200"
 curl "$URL/api/messages?address=%2B15551234567&before_date=…&before_id=…"
 curl "$URL/api/contacts"
 curl "$URL/api/contact?id=42"
+curl "$URL/api/calls?since=1780000000000&limit=200"
+curl "$URL/api/calls?number=%2B15551234567"     # one number's calls
+curl "$URL/api/calls?before_date=…&before_id=…" # older page
 ```
 
 Messages, contacts and contact details carry `deleted_at` (millisecond epoch)
@@ -355,6 +393,7 @@ internal/config     XDG paths + JSON config
 internal/logging    rotating file logger (log.txt)
 internal/sms        SMS model + content-query parser  (unit-tested)
 internal/contact    contact model + content-query parser  (unit-tested)
+internal/call       call-log model, content-query and call-state parsers  (unit-tested)
 internal/database   SQLite schema, dedup import, contacts, deletion marks, search  (unit-tested)
 internal/adb        adb client: server, devices, sms/contacts queries
 internal/notify     libnotify (notify-send) notifications
@@ -373,7 +412,7 @@ or notifier. Supporting sending on another Android release means adding its
 - smsd never deletes messages on the phone or writes to its contacts; its
   only change to the phone is sending the SMS you write.
 - Sending needs a supported Android version (currently 13) and a SIM.
-- SMS only. MMS is not imported yet, and **RCS chat messages can never be**
+- SMS and calls only. MMS is not imported yet, and **RCS chat messages can never be**
   (they are not readable over adb) — keep RCS turned off.
 - Requires the phone unlocked and USB debugging authorised for the host.
 

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jbinder/smsd/internal/call"
 	"github.com/jbinder/smsd/internal/contact"
 	"github.com/jbinder/smsd/internal/database"
 	"github.com/jbinder/smsd/internal/logging"
@@ -56,6 +57,7 @@ func newTestServer(t *testing.T, n int) (*httptest.Server, *database.DB) {
 	mux.HandleFunc("/api/messages", s.handleMessages)
 	mux.HandleFunc("/api/contacts", s.handleContacts)
 	mux.HandleFunc("/api/contact", s.handleContact)
+	mux.HandleFunc("/api/calls", s.handleCalls)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, db
@@ -339,5 +341,38 @@ func TestSendEndpointAuthorisation(t *testing.T) {
 	fake.status = errors.New("no phone connected")
 	if got := send("POST", ok, good); got != http.StatusServiceUnavailable {
 		t.Errorf("send without phone: status %d, want 503", got)
+	}
+}
+
+// The call log pages newest first and links a number to its SMS conversation.
+func TestCalls_PagesAndLinksConversation(t *testing.T) {
+	srv, db := newTestServer(t, 1)
+	var calls []call.Call
+	for i := 1; i <= 5; i++ {
+		calls = append(calls, call.Call{AndroidID: int64(i), Number: "+15551234567",
+			Date: int64(i) * 1000, Type: call.TypeMissed, Presentation: call.PresentationAllowed})
+	}
+	if _, err := db.ImportCalls("dev1", calls, true); err != nil {
+		t.Fatal(err)
+	}
+
+	var page database.CallPage
+	getJSON(t, srv, "/api/calls?limit=3", &page)
+	if !page.HasMore || len(page.Calls) != 3 || page.Calls[0].AndroidID != 5 {
+		t.Fatalf("first page = %+v", page)
+	}
+	if page.Calls[0].Conversation != "+15551234567" {
+		t.Errorf("conversation = %q", page.Calls[0].Conversation)
+	}
+	last := page.Calls[2]
+	getJSON(t, srv, "/api/calls?limit=3&before_date="+strconv.FormatInt(last.Date, 10)+
+		"&before_id="+strconv.FormatInt(last.AndroidID, 10), &page)
+	if page.HasMore || len(page.Calls) != 2 || page.Calls[0].AndroidID != 2 {
+		t.Errorf("second page = %+v", page)
+	}
+
+	getJSON(t, srv, "/api/calls?number="+url.QueryEscape("+44 20 7946 0000"), &page)
+	if len(page.Calls) != 0 || page.Calls == nil {
+		t.Errorf("other number = %+v, want an empty list", page)
 	}
 }

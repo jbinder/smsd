@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jbinder/smsd/internal/call"
 	"github.com/jbinder/smsd/internal/contact"
 	"github.com/jbinder/smsd/internal/sms"
 )
@@ -164,6 +165,54 @@ func (c *Client) QuerySMSTypes(ctx context.Context, serial string, ids []int64) 
 		types[m.AndroidID] = m.Type
 	}
 	return types, nil
+}
+
+// QueryCalls reads the call log for a device. Like QuerySMS, a sinceID > 0
+// requests only newer rows.
+func (c *Client) QueryCalls(ctx context.Context, serial string, sinceID int64) ([]call.Call, error) {
+	remote := fmt.Sprintf(
+		"content query --uri content://call_log/calls --projection %s --sort '_id ASC'",
+		call.ProjectionArg())
+	if sinceID > 0 {
+		remote += fmt.Sprintf(" --where '_id>%d'", sinceID)
+	}
+	out, err := c.run(ctx, "-s", serial, "shell", remote)
+	if err != nil {
+		return nil, err
+	}
+	return call.ParseQueryOutput(out), nil
+}
+
+// QueryCallIDs lists the _id of every call log entry on the device, for
+// noticing deletions the same way QuerySMSIDs does.
+func (c *Client) QueryCallIDs(ctx context.Context, serial string) ([]int64, error) {
+	out, err := c.run(ctx, "-s", serial, "shell", "content query --uri content://call_log/calls --projection _id")
+	if err != nil {
+		return nil, err
+	}
+	calls := call.ParseQueryOutput(out)
+	ids := make([]int64, len(calls))
+	for i, cl := range calls {
+		ids[i] = cl.AndroidID
+	}
+	return ids, nil
+}
+
+// CallState reports whether the phone is ringing, in a call or idle. It reads
+// the telephony registry's dump, which the shell user may do, rather than the
+// call log: a ringing call is not in the log until it ends. Unlike a content
+// query, which starts a Java process on the phone, this costs about a tenth of
+// a second, so it is cheap enough to run on every poll.
+func (c *Client) CallState(ctx context.Context, serial string) (call.State, error) {
+	out, err := c.run(ctx, "-s", serial, "shell", "dumpsys telephony.registry | "+call.StateGrep)
+	if err != nil {
+		return call.State{}, err
+	}
+	st, ok := call.ParseState(out)
+	if !ok {
+		return call.State{}, errors.New("no call state in dumpsys telephony.registry")
+	}
+	return st, nil
 }
 
 // QueryContacts reads every contact and its details (numbers, e-mail

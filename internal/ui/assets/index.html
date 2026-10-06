@@ -158,6 +158,18 @@
   }
   .newbtn:hover { border-color: var(--accent); }
   .newbtn[hidden] { display: none; }
+  /* Call log: a direction glyph per row, missed calls in red. */
+  .conv .kind { display: inline-block; width: 1.3em; color: var(--muted); }
+  .conv.missed .name, .conv.missed .kind, .calls .missed .kind { color: #e5484d; }
+  .calls { margin-top: 6px; }
+  .calls .field .label { width: 170px; flex-basis: 170px; }
+  .calls .kind { display: inline-block; width: 1.3em; color: var(--muted); }
+  .card .actions { display: flex; gap: 8px; margin: -4px 0 8px; }
+  .card .actions button {
+    padding: 3px 9px; cursor: pointer; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 6px; color: var(--fg); font: inherit; font-size: 12px;
+  }
+  .card .actions button:hover { border-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -166,6 +178,7 @@
   <span class="tag">SMS history</span>
   <div class="tabs">
     <button id="tab-messages" class="on">Messages</button>
+    <button id="tab-calls">Calls</button>
     <button id="tab-contacts">Contacts</button>
   </div>
   <label class="scope" id="scope-wrap">Show
@@ -217,7 +230,7 @@ const searchEl = document.getElementById('search');
 const scopeEl = document.getElementById('scope');
 const cfilterEl = document.getElementById('cfilter');
 
-let mode = 'messages';     // 'messages' or 'contacts'
+let mode = 'messages';     // 'messages', 'calls' or 'contacts'
 const TOKEN = document.querySelector('meta[name="smsd-token"]').content;
 
 let since = 0;             // window floor in epoch ms; 0 is the whole history
@@ -227,6 +240,7 @@ let convLoading = false;   // an append request is in flight
 let active = null;         // address of the open conversation
 let thread = null;         // open thread paging state
 let lastToken = null;      // last /api/state fingerprint
+let lastCallToken = null;  // the same for the call log, while on the Calls tab
 
 // The floor is fixed when the window changes rather than recomputed per
 // request, so the list cannot shift under the reader between polls.
@@ -361,12 +375,13 @@ function changeScope() {
   threadEl.replaceChildren(Object.assign(document.createElement('div'),
     { className: 'empty', textContent: 'Select a conversation' }));
   listEl.scrollTop = 0;
-  loadConversations();
+  if (mode === 'calls') { activeCall = null; loadCalls(); } else loadConversations();
 }
 scopeEl.addEventListener('change', changeScope);
 
 listEl.addEventListener('scroll', () => {
-  if (listEl.scrollTop + listEl.clientHeight >= listEl.scrollHeight - 200) appendConversations();
+  if (listEl.scrollTop + listEl.clientHeight < listEl.scrollHeight - 200) return;
+  if (mode === 'calls') appendCalls(); else appendConversations();
 });
 
 /* ---------- thread ---------- */
@@ -497,6 +512,7 @@ let searchTimer = null;
 searchEl.addEventListener('input', () => {
   clearTimeout(searchTimer);
   if (mode === 'contacts') { renderContactList(); return; }
+  if (mode === 'calls') { renderCallList(); return; }
   const q = searchEl.value.trim();
   searchTimer = setTimeout(() => q ? runSearch(q) : loadConversations(), 200);
 });
@@ -629,6 +645,161 @@ function detailValue(d) {
 async function showConversation(address, title) {
   await setMode('messages');
   await openThread(address, { title, all: true });
+}
+
+/* ---------- calls ---------- */
+
+// The call log shares the time window with the conversation list and pages the
+// same way, newest first. Search filters the calls already loaded.
+const CALL_PAGE = 200;
+const CALL_KINDS = {
+  1: ['↙', 'Incoming'], 2: ['↗', 'Outgoing'], 3: ['✕', 'Missed'], 4: ['⌁', 'Voicemail'],
+  5: ['⊘', 'Rejected'], 6: ['⊘', 'Blocked'], 7: ['↙', 'Answered elsewhere'],
+};
+const TYPE_MISSED = 3;
+
+let calls = [];            // loaded call log rows, newest first
+let callsMore = false;     // older calls remain inside the window
+let callsLoading = false;
+let activeCall = null;     // key of the open call row
+
+function callKey(c) { return c.date + ':' + c.android_id; }
+function callKind(c) { return CALL_KINDS[c.type] || ['·', 'Call']; }
+
+function fmtDuration(sec) {
+  if (!sec) return '';
+  const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
+  return (h ? h + 'h ' : '') + (h || m ? m + 'm ' : '') + s + 's';
+}
+
+function callsQuery(extra) {
+  return '/api/calls?since=' + since + '&limit=' + CALL_PAGE + (extra || '');
+}
+
+async function loadCalls() {
+  const page = await api(callsQuery());
+  if (mode !== 'calls') return;
+  calls = page.calls || [];
+  callsMore = page.has_more;
+  renderCallList();
+}
+
+async function appendCalls() {
+  if (mode !== 'calls' || !callsMore || callsLoading || !calls.length) return;
+  callsLoading = true;
+  try {
+    const last = calls[calls.length - 1];
+    const page = await api(callsQuery('&before_date=' + last.date + '&before_id=' + last.android_id));
+    calls = calls.concat(page.calls || []);
+    callsMore = page.has_more;
+    renderCallList();
+  } finally {
+    callsLoading = false;
+  }
+}
+
+// Re-fetch as many calls as are on screen, so a refresh keeps appended pages.
+async function refreshCalls() {
+  const limit = Math.min(Math.max(calls.length, CALL_PAGE), 1000);
+  const page = await api('/api/calls?since=' + since + '&limit=' + limit);
+  calls = page.calls || [];
+  callsMore = page.has_more;
+  renderCallList();
+}
+
+function renderCallList() {
+  const q = searchEl.value.trim().toLowerCase();
+  const digits = q.replace(/\D/g, '');
+  const shown = calls.filter(c => !q || c.caller.toLowerCase().includes(q) ||
+    (digits && c.number.replace(/\D/g, '').includes(digits)));
+  const top = listEl.scrollTop;
+  const frag = document.createDocumentFragment();
+  for (const c of shown) {
+    const [glyph, label] = callKind(c);
+    const div = document.createElement('div');
+    div.className = 'conv' + (c.type === TYPE_MISSED ? ' missed' : '') +
+      (c.deleted_at ? ' deleted' : '') + (callKey(c) === activeCall ? ' active' : '');
+    div.innerHTML =
+      '<div class="name"><span class="kind" title="' + label + '">' + glyph + '</span>' + esc(c.caller) +
+      (c.deleted_at ? '<span class="gone">DELETED</span>' : '') + '</div>' +
+      '<div class="meta">' + label + ' · ' + esc(fmtDate(c.date)) +
+      (c.duration ? ' · ' + fmtDuration(c.duration) : '') + '</div>';
+    div.onclick = () => openCall(c);
+    frag.appendChild(div);
+  }
+  const foot = document.createElement('div');
+  foot.className = 'listend';
+  if (q) {
+    foot.textContent = shown.length + ' of ' + calls.length + ' loaded calls';
+  } else if (callsMore) {
+    const btn = document.createElement('button');
+    btn.textContent = 'Load older calls';
+    btn.onclick = appendCalls;
+    foot.appendChild(btn);
+  } else if (since === 0) {
+    foot.textContent = calls.length ? calls.length + ' calls' : 'No calls yet';
+  } else {
+    foot.textContent = calls.length
+      ? calls.length + ' call' + (calls.length === 1 ? '' : 's') + ' in the ' + scopeLabel()
+      : 'No calls in the ' + scopeLabel();
+    const btn = document.createElement('button');
+    btn.textContent = 'Show everything';
+    btn.onclick = () => { scopeEl.value = '0'; changeScope(); };
+    foot.appendChild(btn);
+  }
+  frag.appendChild(foot);
+  listEl.replaceChildren(frag);
+  listEl.scrollTop = top;
+}
+
+// A call opens the history with that number, across all time, and the way
+// to message them.
+async function openCall(c) {
+  activeCall = callKey(c);
+  renderCallList();
+  const page = c.number
+    ? await api('/api/calls?number=' + encodeURIComponent(c.number) + '&limit=' + CALL_PAGE)
+    : { calls: [c], has_more: false };
+  if (mode !== 'calls' || activeCall !== callKey(c)) return;
+
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = '<h2>' + esc(c.caller) + '</h2>' +
+    (c.contact_name ? '<div class="banner">' + esc(c.number) + '</div>' : '');
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  if (c.conversation) {
+    const btn = document.createElement('button');
+    btn.textContent = 'Messages →';
+    btn.onclick = () => showConversation(c.conversation, c.caller);
+    actions.appendChild(btn);
+  } else if (c.number) {
+    const btn = document.createElement('button');
+    btn.textContent = 'Write SMS →';
+    btn.onclick = async () => { await setMode('messages'); newMessage(c.number); };
+    actions.appendChild(btn);
+  }
+  card.appendChild(actions);
+
+  const n = page.calls.length;
+  card.appendChild(Object.assign(document.createElement('h3'), {
+    textContent: page.has_more ? 'Latest ' + n + ' calls' : n + ' call' + (n === 1 ? '' : 's'),
+  }));
+  const list = document.createElement('div');
+  list.className = 'calls';
+  for (const h of page.calls) {
+    const [glyph, label] = callKind(h);
+    const row = document.createElement('div');
+    row.className = 'field' + (h.type === TYPE_MISSED ? ' missed' : '') + (h.deleted_at ? ' deleted' : '');
+    row.innerHTML = '<span class="label">' + esc(fmtDate(h.date)) + '</span>' +
+      '<span class="value"><span class="kind">' + glyph + '</span>' + label +
+      (h.duration ? ' · ' + fmtDuration(h.duration) : '') + '</span>' +
+      (h.deleted_at ? '<span class="gone" title="noticed ' + esc(fmtDate(h.deleted_at)) + '">DELETED</span>' : '');
+    list.appendChild(row);
+  }
+  card.appendChild(list);
+  threadEl.replaceChildren(card);
+  threadEl.scrollTop = 0;
 }
 
 /* ---------- compose ---------- */
@@ -810,16 +981,22 @@ function countParts(text, size, per) {
 
 /* ---------- mode ---------- */
 
-const tabs = { messages: document.getElementById('tab-messages'), contacts: document.getElementById('tab-contacts') };
+const tabs = {
+  messages: document.getElementById('tab-messages'),
+  calls: document.getElementById('tab-calls'),
+  contacts: document.getElementById('tab-contacts'),
+};
+const EMPTY_TEXT = { messages: 'Select a conversation', calls: 'Select a call', contacts: 'Select a contact' };
 
 async function setMode(m) {
   if (m === mode) return;
   mode = m;
   for (const [k, el] of Object.entries(tabs)) el.classList.toggle('on', k === m);
-  document.getElementById('scope-wrap').hidden = m !== 'messages';
+  document.getElementById('scope-wrap').hidden = m === 'contacts';
   document.getElementById('cfilter-wrap').hidden = m !== 'contacts';
   searchEl.value = '';
   searchEl.placeholder = m === 'messages' ? 'Search name, number or message…' : 'Search name or number…';
+  activeCall = null;
   active = null;
   thread = null;
   newMode = false;
@@ -827,11 +1004,14 @@ async function setMode(m) {
   document.getElementById('new').hidden = m !== 'messages';
   updateCompose();
   threadEl.replaceChildren(Object.assign(document.createElement('div'),
-    { className: 'empty', textContent: m === 'messages' ? 'Select a conversation' : 'Select a contact' }));
+    { className: 'empty', textContent: EMPTY_TEXT[m] }));
   listEl.scrollTop = 0;
-  if (m === 'messages') await loadConversations(); else await loadContacts();
+  if (m === 'messages') await loadConversations();
+  else if (m === 'calls') await loadCalls();
+  else await loadContacts();
 }
 tabs.messages.onclick = () => setMode('messages');
+tabs.calls.onclick = () => setMode('calls');
 tabs.contacts.onclick = () => setMode('contacts');
 
 cfilterEl.addEventListener('change', () => {
@@ -846,6 +1026,14 @@ cfilterEl.addEventListener('change', () => {
 async function poll() {
   const s = await api('/api/state');
   applySendState(s);
+  const callToken = s.calls.count + ':' + s.calls.max_id + ':' + s.calls.deleted;
+  if (mode === 'calls') {
+    const first = lastCallToken === null;
+    if (callToken !== lastCallToken && !first) await refreshCalls();
+    lastCallToken = callToken;
+    return;
+  }
+  lastCallToken = null;
   if (mode !== 'messages' || searchEl.value.trim()) return;
   const token = s.count + ':' + s.max_id + ':' + s.deleted;
   if (token === lastToken) return;

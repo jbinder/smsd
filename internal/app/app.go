@@ -162,9 +162,20 @@ func (a *App) syncDevice(ctx context.Context, serial string, poke <-chan struct{
 	}
 	backfill := !seen
 
+	// Calls have their own backfill: a database from before call support
+	// already knows the phone but has none of its calls, and alerting on its
+	// whole call log would be no better than on its whole SMS history.
+	_, seenCalls, err := a.db.MaxCallID(serial)
+	if err != nil {
+		a.log.Errorf("device %s: reading call watermark: %v", serial, err)
+	}
+	cw := &callWatch{backfill: !seenCalls}
+
 	a.syncContacts(ctx, serial)
 	a.pollOnce(ctx, serial, &backfill)
+	a.syncCalls(ctx, serial, cw)
 	a.checkDeleted(ctx, serial)
+	defer cw.drop(a.note)
 
 	smsTick := time.NewTicker(time.Duration(a.cfg.SMSPollSeconds) * time.Second)
 	defer smsTick.Stop()
@@ -172,6 +183,8 @@ func (a *App) syncDevice(ctx context.Context, serial string, poke <-chan struct{
 	defer contactsTick.Stop()
 	deletedTick := time.NewTicker(time.Duration(a.cfg.DeletedCheckMinutes) * time.Minute)
 	defer deletedTick.Stop()
+	callLogTick := time.NewTicker(callLogFallback)
+	defer callLogTick.Stop()
 
 	for {
 		select {
@@ -179,8 +192,12 @@ func (a *App) syncDevice(ctx context.Context, serial string, poke <-chan struct{
 			return
 		case <-smsTick.C:
 			a.pollOnce(ctx, serial, &backfill)
+			a.watchCalls(ctx, serial, cw)
 		case <-poke:
 			a.pollOnce(ctx, serial, &backfill)
+			a.syncCalls(ctx, serial, cw)
+		case <-callLogTick.C:
+			a.syncCalls(ctx, serial, cw)
 		case <-contactsTick.C:
 			a.syncContacts(ctx, serial)
 		case <-deletedTick.C:
@@ -307,10 +324,15 @@ func (a *App) syncContacts(ctx context.Context, serial string) {
 	a.log.Infof("device %s: synced %d contact(s)%s", serial, len(contacts), res)
 }
 
-// checkDeleted marks stored messages that are no longer on the phone as
-// deleted. It lists every id on the device, so it runs far less often than
-// the incremental poll.
+// checkDeleted marks stored messages and calls that are no longer on the
+// phone as deleted. It lists every id on the device, so it runs far less often
+// than the incremental poll.
 func (a *App) checkDeleted(ctx context.Context, serial string) {
+	a.checkDeletedSMS(ctx, serial)
+	a.checkDeletedCalls(ctx, serial)
+}
+
+func (a *App) checkDeletedSMS(ctx context.Context, serial string) {
 	ids, err := a.adb.QuerySMSIDs(ctx, serial)
 	if err != nil {
 		if ctx.Err() == nil {

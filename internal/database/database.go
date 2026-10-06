@@ -91,6 +91,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_date    ON messages(date);
 	if err := d.migrateContacts(); err != nil {
 		return fmt.Errorf("migrating contacts: %w", err)
 	}
+	if _, err := d.db.Exec(callsSchema); err != nil {
+		return fmt.Errorf("migrating calls: %w", err)
+	}
 	return nil
 }
 
@@ -187,20 +190,23 @@ func (d *DB) ImportMessages(device string, msgs []sms.Message, backfill bool) (I
 	return res, nil
 }
 
-// UnreadCount returns the number of imported received messages not yet marked
-// as notified (the tray's "unread" indicator).
+// UnreadCount returns the number of imported received messages and missed
+// calls not yet marked as notified (the tray's "unread" indicator).
 func (d *DB) UnreadCount() (int, error) {
 	var n int
-	err := d.db.QueryRow(
-		`SELECT COUNT(*) FROM messages WHERE notified = 0 AND type = ?`, sms.TypeReceived,
+	err := d.db.QueryRow(`
+		SELECT (SELECT COUNT(*) FROM messages WHERE notified = 0 AND type = ?)
+		     + (SELECT COUNT(*) FROM calls WHERE notified = 0)`, sms.TypeReceived,
 	).Scan(&n)
 	return n, err
 }
 
-// MarkAllNotified clears the pending-notification flag on all messages. Used by
-// the "Mark notifications read" tray action.
+// MarkAllNotified clears the pending-notification flag on all messages and
+// calls. Used by the "Mark notifications read" tray action.
 func (d *DB) MarkAllNotified() error {
-	_, err := d.db.Exec(`UPDATE messages SET notified = 1 WHERE notified = 0`)
+	_, err := d.db.Exec(`
+		UPDATE messages SET notified = 1 WHERE notified = 0;
+		UPDATE calls SET notified = 1 WHERE notified = 0;`)
 	return err
 }
 
@@ -364,15 +370,24 @@ type State struct {
 	Count   int64 `json:"count"`
 	MaxID   int64 `json:"max_id"`
 	Deleted int64 `json:"deleted"`
+	// Calls fingerprints the call log the same way.
+	Calls struct {
+		Count   int64 `json:"count"`
+		MaxID   int64 `json:"max_id"`
+		Deleted int64 `json:"deleted"`
+	} `json:"calls"`
 }
 
-// State returns the current message count, highest row id and the number of
-// messages marked deleted.
+// State returns the message and call counts, highest row ids and the number of
+// rows marked deleted.
 func (d *DB) State() (State, error) {
 	var s State
-	err := d.db.QueryRow(
-		`SELECT COUNT(*), COALESCE(MAX(id), 0), COUNT(deleted_at) FROM messages`,
-	).Scan(&s.Count, &s.MaxID, &s.Deleted)
+	err := d.db.QueryRow(`
+		SELECT COUNT(*), COALESCE(MAX(id), 0), COUNT(deleted_at),
+		       (SELECT COUNT(*) FROM calls), (SELECT COALESCE(MAX(id), 0) FROM calls),
+		       (SELECT COUNT(deleted_at) FROM calls)
+		FROM messages`,
+	).Scan(&s.Count, &s.MaxID, &s.Deleted, &s.Calls.Count, &s.Calls.MaxID, &s.Calls.Deleted)
 	return s, err
 }
 

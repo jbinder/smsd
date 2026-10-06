@@ -96,6 +96,7 @@ func (s *Server) start() (string, error) {
 	mux.HandleFunc("/api/search", s.handleSearch)
 	mux.HandleFunc("/api/contacts", s.handleContacts)
 	mux.HandleFunc("/api/contact", s.handleContact)
+	mux.HandleFunc("/api/calls", s.handleCalls)
 	mux.HandleFunc("/api/send", s.handleSend)
 
 	s.srv = &http.Server{
@@ -277,6 +278,18 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		AndroidID: int64(intParam(r, "before_id", 0, 1<<62)),
 	}
 	page, err := s.db.Messages(addr, sinceParam(r), cur, intParam(r, "limit", 200, 1000))
+	s.writeJSON(w, page, err)
+}
+
+// handleCalls pages the call log, newest first, optionally for one number.
+// It takes the same window and cursor parameters as handleMessages.
+func (s *Server) handleCalls(w http.ResponseWriter, r *http.Request) {
+	cur := database.Cursor{
+		Date:      int64(intParam(r, "before_date", 0, 1<<62)),
+		AndroidID: int64(intParam(r, "before_id", 0, 1<<62)),
+	}
+	page, err := s.db.Calls(r.URL.Query().Get("number"), sinceParam(r), cur,
+		intParam(r, "limit", 200, 1000))
 	s.writeJSON(w, page, err)
 }
 
