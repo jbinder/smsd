@@ -6,6 +6,18 @@ reply from.
 Built for Arch Linux + i3wm. No Electron, no Qt, no Python, no root, and no app
 installed on the phone.
 
+> [!WARNING]
+> **Turn off RCS ("Chat features") in Google Messages, or smsd will silently miss
+> messages.** RCS chat messages are not SMS: Google Messages keeps them in its
+> own private database, which adb cannot read without root. They never appear in
+> smsd — no error, no notification, nothing in the log. With RCS off, everything
+> arrives as SMS and is imported normally.
+>
+> In Google Messages: **Settings → RCS chats → Turn on RCS chats: off**. On a phone
+> with several users, do this in the **primary user's** Google Messages — that
+> is where SMS land, whichever user is active. Messages that already arrived
+> over RCS cannot be recovered by smsd.
+
 ## What it does
 
 - Starts the `adb` server automatically and detects phones via `adb devices`.
@@ -102,6 +114,9 @@ bridge.
 1. Enable **Developer options** and **USB debugging** on the phone.
 2. Plug in over USB and accept the "Allow USB debugging" prompt.
 3. Confirm the host sees it: `adb devices` should list the phone as `device`.
+4. **Turn off RCS chats in Google Messages** (in the primary user, on a
+   multi-user phone) — see the warning at the top. RCS messages are invisible
+   to smsd.
 
 No companion app is required. smsd only issues standard, non-root `content query`
 commands against `content://sms` and the contacts provider.
@@ -358,7 +373,8 @@ or notifier. Supporting sending on another Android release means adding its
 - smsd never deletes messages on the phone or writes to its contacts; its
   only change to the phone is sending the SMS you write.
 - Sending needs a supported Android version (currently 13) and a SIM.
-- SMS only (no MMS/RCS yet).
+- SMS only. MMS is not imported yet, and **RCS chat messages can never be**
+  (they are not readable over adb) — keep RCS turned off.
 - Requires the phone unlocked and USB debugging authorised for the host.
 
 ## License
