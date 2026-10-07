@@ -42,6 +42,13 @@ installed on the phone.
   device is attached, filled green when connected, blue on unread messages or missed calls, and
   red with an exclamation mark on error. Its menu offers Open SMS History,
   Refresh, Mark notifications read, Reconnect and Quit.
+- Unread tracking — the viewer badges conversations with unread messages and
+  unseen missed calls, and marks them read once you have actually seen them:
+  a conversation after it has been open, scrolled to its newest message, for
+  two seconds while the viewer window is focused; missed calls after two
+  seconds on the Calls tab. Messages that arrive while you are scrolled up in
+  a thread stay unread. The tray's **Mark notifications read** still clears
+  everything at once.
 
 ### Efficient polling
 
@@ -304,7 +311,8 @@ Alerts, all through libnotify and subject to `notify_enabled`:
   removes it.
 - **Missed call** — an unanswered call replaces the incoming-call notification
   with a missed-call alert, which uses `notify_timeout_seconds` like an SMS.
-  Missed calls also turn the tray icon blue until **Mark notifications read**.
+  Missed calls also turn the tray icon blue until seen on the viewer's Calls
+  tab or cleared with **Mark notifications read**.
   Missed calls that happened while the phone was unplugged are alerted on when
   it reconnects (with their time); the first import of a phone's call log is
   silent. Rejected calls are not alerted on.

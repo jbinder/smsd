@@ -210,6 +210,54 @@ func (d *DB) MarkAllNotified() error {
 	return err
 }
 
+// MarkConversationRead clears the pending-notification flag on the messages
+// with address dated at or before until (epoch ms) — the ones the viewer has
+// shown. A message that arrives while the thread is open stays unread until
+// the viewer has rendered it. It returns how many messages changed.
+func (d *DB) MarkConversationRead(address string, until int64) (int64, error) {
+	r, err := d.db.Exec(`
+		UPDATE messages SET notified = 1
+		WHERE address = ? AND date <= ? AND notified = 0`, address, until)
+	if err != nil {
+		return 0, err
+	}
+	return r.RowsAffected()
+}
+
+// MarkCallsRead clears the pending-notification flag on calls dated at or
+// before until (epoch ms), as opening the call log does on a phone. It returns
+// how many calls changed.
+func (d *DB) MarkCallsRead(until int64) (int64, error) {
+	r, err := d.db.Exec(`UPDATE calls SET notified = 1 WHERE date <= ? AND notified = 0`, until)
+	if err != nil {
+		return 0, err
+	}
+	return r.RowsAffected()
+}
+
+// unreadByAddress counts the received messages not yet read per address. The
+// unread set is small, so this is a short scan rather than a cost on every
+// row of the conversation grouping.
+func (d *DB) unreadByAddress() (map[string]int, error) {
+	rows, err := d.db.Query(`
+		SELECT address, COUNT(*) FROM messages
+		WHERE notified = 0 AND type = ? GROUP BY address`, sms.TypeReceived)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var addr string
+		var n int
+		if err := rows.Scan(&addr, &n); err != nil {
+			return nil, err
+		}
+		out[addr] = n
+	}
+	return out, rows.Err()
+}
+
 // NormalizePhone reduces a phone number to comparable digits, keeping only the
 // last 10 significant digits so that "+1 (555) 123-4567" and "555-123-4567"
 // resolve to the same contact.
@@ -234,6 +282,9 @@ type Conversation struct {
 	LastBody    string `json:"last_body"`
 	LastDate    int64  `json:"last_date"`
 	Count       int    `json:"count"`
+	// Unread counts received messages not yet seen in the viewer or cleared
+	// from the tray.
+	Unread int `json:"unread,omitempty"`
 }
 
 // Conversations returns one row per address, most recently active first, with
@@ -251,6 +302,10 @@ type Conversation struct {
 // expression, so it degrades into a scan of the whole contact table per row.
 func (d *DB) Conversations(since int64, limit, offset int) ([]Conversation, error) {
 	names, err := d.contactNames()
+	if err != nil {
+		return nil, err
+	}
+	unread, err := d.unreadByAddress()
 	if err != nil {
 		return nil, err
 	}
@@ -284,6 +339,7 @@ func (d *DB) Conversations(since int64, limit, offset int) ([]Conversation, erro
 			return nil, err
 		}
 		c.ContactName = names[NormalizePhone(c.Address)]
+		c.Unread = unread[c.Address]
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -370,24 +426,31 @@ type State struct {
 	Count   int64 `json:"count"`
 	MaxID   int64 `json:"max_id"`
 	Deleted int64 `json:"deleted"`
+	// Unread counts received messages not yet read, so marking them read
+	// (here or from the tray) changes the fingerprint too.
+	Unread int64 `json:"unread"`
 	// Calls fingerprints the call log the same way.
 	Calls struct {
 		Count   int64 `json:"count"`
 		MaxID   int64 `json:"max_id"`
 		Deleted int64 `json:"deleted"`
+		Unread  int64 `json:"unread"`
 	} `json:"calls"`
 }
 
-// State returns the message and call counts, highest row ids and the number of
-// rows marked deleted.
+// State returns the message and call counts, highest row ids, the number of
+// rows marked deleted and the number still unread.
 func (d *DB) State() (State, error) {
 	var s State
 	err := d.db.QueryRow(`
 		SELECT COUNT(*), COALESCE(MAX(id), 0), COUNT(deleted_at),
+		       COALESCE(SUM(notified = 0 AND type = ?), 0),
 		       (SELECT COUNT(*) FROM calls), (SELECT COALESCE(MAX(id), 0) FROM calls),
-		       (SELECT COUNT(deleted_at) FROM calls)
-		FROM messages`,
-	).Scan(&s.Count, &s.MaxID, &s.Deleted, &s.Calls.Count, &s.Calls.MaxID, &s.Calls.Deleted)
+		       (SELECT COUNT(deleted_at) FROM calls),
+		       (SELECT COUNT(*) FROM calls WHERE notified = 0)
+		FROM messages`, sms.TypeReceived,
+	).Scan(&s.Count, &s.MaxID, &s.Deleted, &s.Unread,
+		&s.Calls.Count, &s.Calls.MaxID, &s.Calls.Deleted, &s.Calls.Unread)
 	return s, err
 }
 

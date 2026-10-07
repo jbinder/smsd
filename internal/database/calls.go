@@ -128,6 +128,9 @@ type StoredCall struct {
 	// if there is one.
 	Conversation string `json:"conversation,omitempty"`
 	DeletedAt    int64  `json:"deleted_at,omitempty"`
+	// Unread marks a missed call not yet seen in the viewer or cleared from
+	// the tray.
+	Unread bool `json:"unread,omitempty"`
 }
 
 // CallPage is one page of the call log, newest first.
@@ -160,7 +163,8 @@ func (d *DB) Calls(number string, since int64, cur Cursor, limit int) (CallPage,
 	args = append(args, limit+1)
 
 	rows, err := d.db.Query(`
-		SELECT android_id, number, date, duration, type, presentation, COALESCE(deleted_at, 0)
+		SELECT android_id, number, date, duration, type, presentation, COALESCE(deleted_at, 0),
+		       notified = 0
 		FROM calls WHERE `+where+`
 		ORDER BY date DESC, android_id DESC
 		LIMIT ?`, args...)
@@ -173,7 +177,7 @@ func (d *DB) Calls(number string, since int64, cur Cursor, limit int) (CallPage,
 	for rows.Next() {
 		var c StoredCall
 		if err := rows.Scan(&c.AndroidID, &c.Number, &c.Date, &c.Duration, &c.Type,
-			&c.Presentation, &c.DeletedAt); err != nil {
+			&c.Presentation, &c.DeletedAt, &c.Unread); err != nil {
 			return page, err
 		}
 		page.Calls = append(page.Calls, c)

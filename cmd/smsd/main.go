@@ -75,6 +75,7 @@ func run() error {
 
 	application := app.New(cfg, logger, client, db, notifier, viewer)
 	viewer.SetSender(application)
+	viewer.SetOnRead(application.ReadChanged)
 
 	// Root context cancelled on quit or signal.
 	ctx, cancel := context.WithCancel(context.Background())

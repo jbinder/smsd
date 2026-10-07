@@ -505,6 +505,9 @@ func (a *App) MarkRead() {
 	a.refreshState()
 }
 
+// ReadChanged updates the tray after the viewer marked messages or calls read.
+func (a *App) ReadChanged() { a.refreshState() }
+
 // Reconnect restarts the adb server and drops all device loops so they are
 // re-established on the next scan.
 func (a *App) Reconnect(ctx context.Context) {

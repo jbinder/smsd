@@ -376,3 +376,83 @@ func TestCalls_PagesAndLinksConversation(t *testing.T) {
 		t.Errorf("other number = %+v, want an empty list", page)
 	}
 }
+
+// The viewer marks what it has shown as read; like sending, only the page may.
+func TestReadEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	db, err := database.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ImportMessages("dev1", []sms.Message{
+		{AndroidID: 1, ThreadID: 1, Address: "+15551234567", Body: "a", Date: 1000, Type: sms.TypeReceived},
+		{AndroidID: 2, ThreadID: 1, Address: "+15551234567", Body: "b", Date: 2000, Type: sms.TypeReceived},
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ImportCalls("dev1", []call.Call{
+		{AndroidID: 1, Number: "+1", Date: 1000, Type: call.TypeMissed, Presentation: call.PresentationAllowed},
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	log, err := logging.New(filepath.Join(dir, "log.txt"), 1<<20, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	s := New(db, "127.0.0.1:0", log)
+	hooked := 0
+	s.SetOnRead(func() { hooked++ })
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/read", s.handleRead)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	post := func(token, body string) int {
+		t.Helper()
+		req, _ := http.NewRequest("POST", srv.URL+"/api/read", strings.NewReader(body))
+		req.Header.Set("X-Smsd-Token", token)
+		req.Header.Set("Origin", srv.URL)
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	for name, tc := range map[string]struct {
+		token, body string
+		want        int
+	}{
+		"no token":     {"", `{"address":"+15551234567","until":1000}`, http.StatusForbidden},
+		"no until":     {s.token, `{"address":"+15551234567"}`, http.StatusBadRequest},
+		"no target":    {s.token, `{"until":1000}`, http.StatusBadRequest},
+		"both targets": {s.token, `{"address":"+1","calls":true,"until":1000}`, http.StatusBadRequest},
+		"malformed":    {s.token, `{`, http.StatusBadRequest},
+	} {
+		if got := post(tc.token, tc.body); got != tc.want {
+			t.Errorf("%s: status %d, want %d", name, got, tc.want)
+		}
+	}
+	if n, _ := db.UnreadCount(); n != 3 || hooked != 0 {
+		t.Fatalf("rejected requests changed state: unread %d, hook ran %d times", n, hooked)
+	}
+
+	if got := post(s.token, `{"address":"+15551234567","until":1000}`); got != http.StatusOK {
+		t.Fatalf("mark conversation: status %d", got)
+	}
+	if got := post(s.token, `{"calls":true,"until":1000}`); got != http.StatusOK {
+		t.Fatalf("mark calls: status %d", got)
+	}
+	// Nothing left to mark up to that date: no tray refresh needed.
+	if got := post(s.token, `{"calls":true,"until":1000}`); got != http.StatusOK {
+		t.Fatalf("repeat mark: status %d", got)
+	}
+	if n, _ := db.UnreadCount(); n != 1 {
+		t.Errorf("unread = %d, want 1 (the message after until)", n)
+	}
+	if hooked != 2 {
+		t.Errorf("hook ran %d times, want 2", hooked)
+	}
+}

@@ -169,3 +169,32 @@ func TestCalls_PagingFilterAndNames(t *testing.T) {
 		t.Errorf("windowed = %d calls, want 2", len(page.Calls))
 	}
 }
+
+func TestMarkCallsRead(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.ImportCalls("dev1", []call.Call{
+		phoneCall(1, call.TypeMissed, "+1"),
+		phoneCall(2, call.TypeMissed, "+2"),
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := db.State(); s.Calls.Unread != 2 {
+		t.Fatalf("State.Calls.Unread = %d, want 2", s.Calls.Unread)
+	}
+	n, err := db.MarkCallsRead(phoneCall(1, 0, "").Date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("marked %d, want 1", n)
+	}
+	page, err := db.Calls("", 0, Cursor{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range page.Calls {
+		if want := c.AndroidID == 2; c.Unread != want {
+			t.Errorf("call %d unread = %v, want %v", c.AndroidID, c.Unread, want)
+		}
+	}
+}

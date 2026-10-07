@@ -48,6 +48,12 @@
   .conv .name { font-weight: 600; }
   .conv .preview { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .conv .meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .conv.unread .name { font-weight: 700; }
+  .conv.unread .preview { color: var(--fg); }
+  .badge {
+    float: right; min-width: 1.6em; padding: 0 6px; border-radius: 9px; background: var(--accent);
+    color: #fff; font-size: 11px; font-weight: 600; line-height: 18px; text-align: center;
+  }
   #thread { flex: 1 1 auto; overflow-y: auto; padding: 16px 20px; min-width: 0; min-height: 0; }
   #thread .empty { color: var(--muted); text-align: center; margin-top: 40px; }
   /* The title needs an opaque, full-bleed background or messages scroll through
@@ -280,12 +286,16 @@ function convRow(c) {
 // The signature lets a refresh skip rows whose rendering would not change,
 // which is what keeps an idle list from flickering.
 function fillConvRow(div, c) {
-  const sig = c.last_date + '|' + c.count + '|' + c.contact_name + '|' + c.last_body;
+  const unread = c.unread || 0;
+  const sig = c.last_date + '|' + c.count + '|' + c.contact_name + '|' + c.last_body + '|' + unread;
   if (div.dataset.sig === sig) return;
   div.dataset.sig = sig;
   div.dataset.title = c.contact_name || c.address;
+  div.dataset.unread = unread;
+  div.classList.toggle('unread', unread > 0);
   div.innerHTML =
-    '<div class="name">' + esc(div.dataset.title) + '</div>' +
+    '<div class="name">' + (unread ? '<span class="badge">' + unread + '</span>' : '') +
+    esc(div.dataset.title) + '</div>' +
     '<div class="preview">' + esc(c.last_body) + '</div>' +
     '<div class="meta">' + esc(fmtDate(c.last_date)) + ' · ' + c.count + ' msgs</div>';
 }
@@ -306,6 +316,7 @@ function renderConvList(convs) {
   }
   listEl.replaceChildren(frag);
   if (convDone) listEl.appendChild(listFooter(convs.length));
+  scheduleRead();
 }
 
 // Says how much of the history is in view and offers the way out of the window,
@@ -431,7 +442,7 @@ async function openThread(address, opts = {}) {
   // thread.since mirrors the window until the reader asks for older messages,
   // at which point it drops to 0 for this thread only.
   thread = { address, since: floor, hasMore: page.has_more, oldest: msgs[0] || null,
-    title: opts.title };
+    newest: msgs.length ? msgs[msgs.length - 1].date : 0, title: opts.title };
 
   threadEl.replaceChildren();
   const h2 = document.createElement('h2');
@@ -457,6 +468,7 @@ async function openThread(address, opts = {}) {
   showPending(address, msgs);
   threadEl.scrollTop = threadEl.scrollHeight;
   updateCompose();
+  scheduleRead();
 }
 
 // Inside the window the button pages backwards; once the window is exhausted it
@@ -717,10 +729,11 @@ function renderCallList() {
   for (const c of shown) {
     const [glyph, label] = callKind(c);
     const div = document.createElement('div');
-    div.className = 'conv' + (c.type === TYPE_MISSED ? ' missed' : '') +
+    div.className = 'conv' + (c.type === TYPE_MISSED ? ' missed' : '') + (c.unread ? ' unread' : '') +
       (c.deleted_at ? ' deleted' : '') + (callKey(c) === activeCall ? ' active' : '');
     div.innerHTML =
-      '<div class="name"><span class="kind" title="' + label + '">' + glyph + '</span>' + esc(c.caller) +
+      '<div class="name">' + (c.unread ? '<span class="badge">new</span>' : '') +
+      '<span class="kind" title="' + label + '">' + glyph + '</span>' + esc(c.caller) +
       (c.deleted_at ? '<span class="gone">DELETED</span>' : '') + '</div>' +
       '<div class="meta">' + label + ' · ' + esc(fmtDate(c.date)) +
       (c.duration ? ' · ' + fmtDuration(c.duration) : '') + '</div>';
@@ -750,6 +763,7 @@ function renderCallList() {
   frag.appendChild(foot);
   listEl.replaceChildren(frag);
   listEl.scrollTop = top;
+  scheduleRead();
 }
 
 // A call opens the history with that number, across all time, and the way
@@ -1019,6 +1033,62 @@ cfilterEl.addEventListener('change', () => {
   renderContactList();
 });
 
+/* ---------- read tracking ---------- */
+
+// As in phone messaging apps, what the reader has actually looked at counts as
+// read: an open thread scrolled to its newest message, or the call log, while
+// this window is visible and focused. The short dwell keeps flicking through
+// the list from clearing every conversation it passes. Only what has been
+// rendered is marked (up to its date), so a message arriving meanwhile stays
+// unread until it is shown.
+const READ_DWELL_MS = 2000;
+let readTimer = null;
+
+function seenTarget() {
+  if (document.visibilityState !== 'visible' || !document.hasFocus()) return null;
+  if (mode === 'messages' && thread && thread.newest) {
+    if (threadEl.scrollTop + threadEl.clientHeight < threadEl.scrollHeight - 40) return null;
+    // A thread opened from a contact card may not be in the list; ask anyway.
+    const row = listEl.querySelector('.conv[data-address="' + CSS.escape(thread.address) + '"]');
+    if (row && row.dataset.unread === '0') return null;
+    return { address: thread.address, until: thread.newest };
+  }
+  if (mode === 'calls' && calls.some(c => c.unread)) {
+    return { calls: true, until: calls[0].date };
+  }
+  return null;
+}
+
+// Called whenever what is on screen may have changed; (re)starts the dwell.
+function scheduleRead() {
+  clearTimeout(readTimer);
+  readTimer = null;
+  const target = seenTarget();
+  if (!target) return;
+  const key = JSON.stringify(target);
+  readTimer = setTimeout(() => {
+    readTimer = null;
+    if (JSON.stringify(seenTarget()) === key) markRead(target).catch(() => {});
+  }, READ_DWELL_MS);
+}
+
+async function markRead(target) {
+  const r = await fetch('/api/read', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Smsd-Token': TOKEN },
+    body: JSON.stringify(target),
+  });
+  if (!r.ok) throw new Error('/api/read: ' + r.status);
+  if ((await r.json()).marked === 0) return;
+  if (target.calls) { if (mode === 'calls') await refreshCalls(); }
+  else if (mode === 'messages' && !searchEl.value.trim()) await refreshConvList();
+}
+
+threadEl.addEventListener('scroll', scheduleRead, { passive: true });
+window.addEventListener('focus', scheduleRead);
+window.addEventListener('blur', () => { clearTimeout(readTimer); readTimer = null; });
+document.addEventListener('visibilitychange', scheduleRead);
+
 /* ---------- refresh ---------- */
 
 // Polling a fingerprint instead of the whole list means an idle viewer does no
@@ -1026,7 +1096,7 @@ cfilterEl.addEventListener('change', () => {
 async function poll() {
   const s = await api('/api/state');
   applySendState(s);
-  const callToken = s.calls.count + ':' + s.calls.max_id + ':' + s.calls.deleted;
+  const callToken = s.calls.count + ':' + s.calls.max_id + ':' + s.calls.deleted + ':' + s.calls.unread;
   if (mode === 'calls') {
     const first = lastCallToken === null;
     if (callToken !== lastCallToken && !first) await refreshCalls();
@@ -1035,7 +1105,7 @@ async function poll() {
   }
   lastCallToken = null;
   if (mode !== 'messages' || searchEl.value.trim()) return;
-  const token = s.count + ':' + s.max_id + ':' + s.deleted;
+  const token = s.count + ':' + s.max_id + ':' + s.deleted + ':' + s.unread;
   if (token === lastToken) return;
   const first = lastToken === null;
   lastToken = token;

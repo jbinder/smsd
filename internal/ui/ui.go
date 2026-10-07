@@ -1,5 +1,6 @@
 // Package ui serves the SMS conversation viewer over loopback HTTP and opens it
-// in the user's browser. Its only write is sending an SMS. A tiny embedded single-page app keeps the
+// in the user's browser. Its only writes are sending an SMS and marking what
+// the reader has seen as read. A tiny embedded single-page app keeps the
 // idle daemon lightweight: no GUI toolkit is linked and the server only runs
 // while the viewer is open.
 package ui
@@ -44,6 +45,9 @@ type Server struct {
 	log    *logging.Logger
 	addr   string
 	sender Sender
+	// onRead runs after the viewer marked something read, so the tray can
+	// drop its unread indicator.
+	onRead func()
 	// token authorises sends. It is generated per run and only handed out
 	// inside the page, which other sites cannot read.
 	token string
@@ -65,6 +69,10 @@ func New(db *database.DB, addr string, log *logging.Logger) *Server {
 
 // SetSender enables sending from the viewer.
 func (s *Server) SetSender(sender Sender) { s.sender = sender }
+
+// SetOnRead registers fn to run whenever the viewer marks messages or calls
+// read.
+func (s *Server) SetOnRead(fn func()) { s.onRead = fn }
 
 // Open ensures the server is running and launches the browser at its URL.
 func (s *Server) Open() error {
@@ -98,6 +106,7 @@ func (s *Server) start() (string, error) {
 	mux.HandleFunc("/api/contact", s.handleContact)
 	mux.HandleFunc("/api/calls", s.handleCalls)
 	mux.HandleFunc("/api/send", s.handleSend)
+	mux.HandleFunc("/api/read", s.handleRead)
 
 	s.srv = &http.Server{
 		Handler:           mux,
@@ -180,8 +189,7 @@ func (s *Server) sendStatus() error {
 // goes away mid-send must not cut a multipart message short.
 const sendTimeout = 90 * time.Second
 
-// handleSend sends one SMS. This is the viewer's only write, and it costs
-// money, so it only accepts requests the viewer page itself made — see
+// handleSend sends one SMS. It costs money, so it only accepts requests the viewer page itself made — see
 // authorised.
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -221,7 +229,48 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}{sentTo}, nil)
 }
 
-// authorised accepts a send only from the viewer page. Any site open in the
+// handleRead marks what the viewer has shown as read: one conversation's
+// messages, or the call log, up to the newest item rendered (until, epoch ms).
+// The page decides when the reader has actually seen them.
+func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.authorised(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	var req struct {
+		Address string `json:"address"`
+		Calls   bool   `json:"calls"`
+		Until   int64  `json:"until"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if (req.Address == "") == !req.Calls || req.Until <= 0 {
+		http.Error(w, "one of address or calls, and until, are required", http.StatusBadRequest)
+		return
+	}
+	var n int64
+	var err error
+	if req.Calls {
+		n, err = s.db.MarkCallsRead(req.Until)
+	} else {
+		n, err = s.db.MarkConversationRead(req.Address, req.Until)
+	}
+	if err == nil && n > 0 && s.onRead != nil {
+		s.onRead()
+	}
+	s.writeJSON(w, struct {
+		Marked int64 `json:"marked"`
+	}{n}, err)
+}
+
+// authorised accepts a write only from the viewer page. Any site open in the
 // user's browser can make it POST to a loopback port, so:
 //   - the page's per-run token must come back in a header. Other origins
 //     cannot read the page to learn it, and a custom header also forces a

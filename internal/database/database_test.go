@@ -479,3 +479,50 @@ func TestNormalizePhone(t *testing.T) {
 		}
 	}
 }
+
+func TestMarkConversationRead(t *testing.T) {
+	db := openTestDB(t)
+	other := msg(4, sms.TypeReceived, "elsewhere")
+	other.Address = "+15550000000"
+	if _, err := db.ImportMessages("dev1", []sms.Message{
+		msg(1, sms.TypeReceived, "r1"),
+		msg(2, sms.TypeReceived, "r2"),
+		msg(3, sms.TypeReceived, "r3"),
+		other,
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	unread := func() map[string]int {
+		t.Helper()
+		convs, err := db.Conversations(0, 10, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]int{}
+		for _, c := range convs {
+			out[c.Address] = c.Unread
+		}
+		return out
+	}
+	if got := unread(); got["+15551234567"] != 3 || got["+15550000000"] != 1 {
+		t.Fatalf("unread before = %v", got)
+	}
+
+	// Only messages up to the date the viewer rendered are marked.
+	n, err := db.MarkConversationRead("+15551234567", msg(2, 0, "").Date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("marked %d, want 2", n)
+	}
+	if got := unread(); got["+15551234567"] != 1 || got["+15550000000"] != 1 {
+		t.Errorf("unread after = %v, want 1 left in each", got)
+	}
+	if s, _ := db.State(); s.Unread != 2 {
+		t.Errorf("State.Unread = %d, want 2", s.Unread)
+	}
+	if n, _ := db.UnreadCount(); n != 2 {
+		t.Errorf("UnreadCount = %d, want 2", n)
+	}
+}
