@@ -182,6 +182,9 @@
 <header>
   <h1>smsd</h1>
   <span class="tag">SMS history</span>
+  <label class="scope" id="profile-wrap" hidden title="Each phone's history is kept in a profile of its own">Phone
+    <select id="profile"></select>
+  </label>
   <div class="tabs">
     <button id="tab-messages" class="on">Messages</button>
     <button id="tab-calls">Calls</button>
@@ -235,8 +238,10 @@ const threadEl = document.getElementById('thread');
 const searchEl = document.getElementById('search');
 const scopeEl = document.getElementById('scope');
 const cfilterEl = document.getElementById('cfilter');
+const profileEl = document.getElementById('profile');
 
 let mode = 'messages';     // 'messages', 'calls' or 'contacts'
+let profile = null;        // id of the profile on screen; null until known
 const TOKEN = document.querySelector('meta[name="smsd-token"]').content;
 
 let since = 0;             // window floor in epoch ms; 0 is the whole history
@@ -266,8 +271,14 @@ function fmtDate(ms) {
 function esc(s) {
   return (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
+// Every request names the profile on screen. Before one is known the server
+// answers for its first profile.
+function withProfile(path) {
+  if (!profile) return path;
+  return path + (path.includes('?') ? '&' : '?') + 'profile=' + encodeURIComponent(profile);
+}
 async function api(path) {
-  const r = await fetch(path);
+  const r = await fetch(withProfile(path));
   if (!r.ok) throw new Error(path + ': ' + r.status);
   return await r.json();
 }
@@ -859,14 +870,18 @@ function updateCompose() {
 }
 
 // Keeps unsent text with the conversation it was written in, so switching
-// threads can never send it to someone else.
+// threads or profiles can never send it to someone else.
+function draftKey(address) {
+  return profile + '\n' + address;
+}
 function switchDraft(address) {
-  if (draftFor === address) return;
+  const key = address === null ? null : draftKey(address);
+  if (draftFor === key) return;
   if (draftFor !== null) {
     if (bodyEl.value) drafts.set(draftFor, bodyEl.value); else drafts.delete(draftFor);
   }
-  draftFor = address;
-  bodyEl.value = drafts.get(address) || '';
+  draftFor = key;
+  bodyEl.value = key === null ? '' : drafts.get(key) || '';
   autosize();
 }
 
@@ -889,7 +904,7 @@ async function sendMessage() {
   notice = null;
   updateCompose();
   try {
-    const r = await fetch('/api/send', {
+    const r = await fetch(withProfile('/api/send'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Smsd-Token': TOKEN },
       body: JSON.stringify({ address, body }),
@@ -897,12 +912,12 @@ async function sendMessage() {
     if (!r.ok) throw new Error((await r.text()).trim() || r.status);
     // The server strips a number's formatting; that is the thread it lands in.
     const sentTo = (await r.json()).address || address;
-    pendingSends.push({ address: sentTo, body, at: Date.now() });
+    pendingSends.push({ profile, address: sentTo, body, at: Date.now() });
     bodyEl.value = '';
-    drafts.delete(address);
+    drafts.delete(draftKey(address));
     autosize();
     if (newMode) {
-      draftFor = sentTo;
+      draftFor = draftKey(sentTo);
       await openThread(sentTo, { all: true });
     } else {
       showPending(address, []);
@@ -930,7 +945,7 @@ function showPending(address, msgs) {
     if (arrived || now - p.at > 10 * 60000) pendingSends.splice(i, 1);
   }
   for (const p of pendingSends) {
-    if (p.address !== address) continue;
+    if (p.profile !== profile || p.address !== address) continue;
     const el = bubbleEl({ body: p.body, date: p.at, received: false, type: TYPE_OUTBOX });
     el.classList.add('local');
     bubbles.querySelector('.empty')?.remove();
@@ -1073,7 +1088,7 @@ function scheduleRead() {
 }
 
 async function markRead(target) {
-  const r = await fetch('/api/read', {
+  const r = await fetch(withProfile('/api/read'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Smsd-Token': TOKEN },
     body: JSON.stringify(target),
@@ -1089,12 +1104,70 @@ window.addEventListener('focus', scheduleRead);
 window.addEventListener('blur', () => { clearTimeout(readTimer); readTimer = null; });
 document.addEventListener('visibilitychange', scheduleRead);
 
+/* ---------- profiles ---------- */
+
+// Each phone's history lives in a profile of its own; the viewer shows one at
+// a time. The list rides along with every state poll, so a profile set up
+// from the tray appears here by itself.
+let profileSig = null;
+
+function renderProfiles(list) {
+  const sig = JSON.stringify(list);
+  if (sig === profileSig) return; // rebuilding would close an open dropdown
+  profileSig = sig;
+  profileEl.replaceChildren(...list.map(p => Object.assign(document.createElement('option'), {
+    value: p.id,
+    textContent: p.name + (p.connected ? ' · connected' : '') + (p.unread ? ' (' + p.unread + ' new)' : ''),
+  })));
+  profileEl.value = profile || '';
+  document.getElementById('profile-wrap').hidden = list.length === 0;
+}
+
+// Keeps the profile on screen one the server has. Returns false when it had to
+// change, which it then does.
+function syncProfiles(list) {
+  renderProfiles(list);
+  if (profile && list.some(p => p.id === profile)) return true;
+  if (!list.length && profile === null && setupShown) return false;
+  const saved = localStorage.getItem('smsd.profile');
+  const next = list.find(p => p.id === saved) || list.find(p => p.connected) || list[0];
+  showProfile(next ? next.id : null).catch(() => {});
+  return false;
+}
+
+let setupShown = false;
+
+async function showProfile(id) {
+  profile = id;
+  profileEl.value = id || '';
+  lastToken = null;
+  lastCallToken = null;
+  contacts = [];
+  setupShown = false;
+  if (!id) {
+    setupShown = true;
+    thread = null;
+    newMode = false;
+    updateCompose();
+    listEl.replaceChildren();
+    threadEl.innerHTML = '<div class="empty">No phone is set up yet.<br>Plug one in and choose ' +
+      '<b>New phone → Create a new profile</b> in the smsd tray menu.</div>';
+    return;
+  }
+  localStorage.setItem('smsd.profile', id);
+  const m = mode;
+  mode = null; // makes setMode reload the tab
+  await setMode(m);
+}
+profileEl.addEventListener('change', () => showProfile(profileEl.value).catch(() => {}));
+
 /* ---------- refresh ---------- */
 
 // Polling a fingerprint instead of the whole list means an idle viewer does no
 // rendering work at all, and a busy one only redraws once per actual change.
 async function poll() {
   const s = await api('/api/state');
+  if (!syncProfiles(s.profiles || [])) return;
   applySendState(s);
   const callToken = s.calls.count + ':' + s.calls.max_id + ':' + s.calls.deleted + ':' + s.calls.unread;
   if (mode === 'calls') {
@@ -1124,7 +1197,8 @@ if (saved !== null && [...scopeEl.options].some(o => o.value === saved)) scopeEl
 const savedFilter = localStorage.getItem('smsd.cfilter');
 if (savedFilter !== null && [...cfilterEl.options].some(o => o.value === savedFilter)) cfilterEl.value = savedFilter;
 applyScope();
-loadConversations().then(poll).catch(() => {});
+// The first poll learns the profiles and loads the one to show.
+poll().catch(() => {});
 setInterval(() => poll().catch(() => {}), 5000);
 </script>
 </body>

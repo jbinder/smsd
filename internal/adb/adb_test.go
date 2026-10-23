@@ -9,17 +9,21 @@ func TestParseDevices(t *testing.T) {
 	out := "List of devices attached\n" +
 		"emulator-5554\tdevice\n" +
 		"ABC123\tunauthorized\n" +
+		"HQ617A1F6F             device usb:1-3 product:XQ-BT52_EEA model:XQ_BT52 device:XQ-BT52 transport_id:113\n" +
 		"XYZ789\toffline\n" +
 		"* daemon started successfully *\n"
 	devs := parseDevices(out)
-	if len(devs) != 3 {
-		t.Fatalf("got %d devices, want 3: %+v", len(devs), devs)
+	if len(devs) != 4 {
+		t.Fatalf("got %d devices, want 4: %+v", len(devs), devs)
 	}
 	if !devs[0].Connected() {
 		t.Errorf("emulator should be connected")
 	}
 	if devs[1].State != "unauthorized" || devs[1].Connected() {
 		t.Errorf("ABC123 state wrong: %+v", devs[1])
+	}
+	if d := devs[2]; d.Serial != "HQ617A1F6F" || !d.Connected() || d.Model != "XQ_BT52" {
+		t.Errorf("long-format line parsed wrong: %+v", d)
 	}
 }
 

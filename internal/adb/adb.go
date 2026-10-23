@@ -37,6 +37,7 @@ func New(path string) *Client {
 type Device struct {
 	Serial string
 	State  string // "device", "unauthorized", "offline", ...
+	Model  string // e.g. "XQ_BT52"; empty when adb does not report one
 }
 
 // Connected reports whether the device is fully usable.
@@ -82,7 +83,7 @@ func (c *Client) KillServer(ctx context.Context) error {
 
 // Devices returns the currently known devices and their states.
 func (c *Client) Devices(ctx context.Context) ([]Device, error) {
-	out, err := c.run(ctx, "devices")
+	out, err := c.run(ctx, "devices", "-l")
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +101,13 @@ func parseDevices(out string) []Device {
 		if len(fields) < 2 {
 			continue
 		}
-		devs = append(devs, Device{Serial: fields[0], State: fields[1]})
+		d := Device{Serial: fields[0], State: fields[1]}
+		for _, f := range fields[2:] {
+			if m, ok := strings.CutPrefix(f, "model:"); ok {
+				d.Model = m
+			}
+		}
+		devs = append(devs, d)
 	}
 	return devs
 }

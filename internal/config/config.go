@@ -62,9 +62,14 @@ type Paths struct {
 	DataDir   string // ~/.local/share/smsd
 	StateDir  string // ~/.local/state/smsd
 
-	ConfigFile string // ~/.config/smsd/config.json
-	DBFile     string // ~/.local/share/smsd/smsd.db
-	LogFile    string // ~/.local/state/smsd/log.txt
+	ConfigFile   string // ~/.config/smsd/config.json
+	ProfilesFile string // ~/.config/smsd/profiles.json
+	ProfilesDir  string // ~/.local/share/smsd/profiles, one database per profile
+	// DBFile is the single database older versions shared between all phones.
+	// It is only read once, to split it into profiles, and then kept as a
+	// backup.
+	DBFile  string // ~/.local/share/smsd/smsd.db
+	LogFile string // ~/.local/state/smsd/log.txt
 }
 
 func xdgDir(envVar, fallbackRel string) (string, error) {
@@ -99,6 +104,8 @@ func ResolvePaths() (Paths, error) {
 		StateDir:  filepath.Join(stateBase, "smsd"),
 	}
 	p.ConfigFile = filepath.Join(p.ConfigDir, "config.json")
+	p.ProfilesFile = filepath.Join(p.ConfigDir, "profiles.json")
+	p.ProfilesDir = filepath.Join(p.DataDir, "profiles")
 	p.DBFile = filepath.Join(p.DataDir, "smsd.db")
 	p.LogFile = filepath.Join(p.StateDir, "log.txt")
 	return p, nil
@@ -106,7 +113,7 @@ func ResolvePaths() (Paths, error) {
 
 // EnsureDirs creates the config, data and state directories if missing.
 func (p Paths) EnsureDirs() error {
-	for _, d := range []string{p.ConfigDir, p.DataDir, p.StateDir} {
+	for _, d := range []string{p.ConfigDir, p.DataDir, p.ProfilesDir, p.StateDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return fmt.Errorf("creating %s: %w", d, err)
 		}

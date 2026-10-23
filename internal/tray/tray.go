@@ -27,6 +27,23 @@ type Callbacks struct {
 	OnMarkRead    func()
 	OnReconnect   func()
 	OnQuit        func()
+
+	// A phone waiting for a profile is put in a new one, added to an existing
+	// one, or ignored.
+	OnNewProfile func(serial string)
+	OnAttach     func(serial, profileID string)
+	OnIgnore     func(serial string)
+}
+
+// Pending is a connected phone that belongs to no profile yet.
+type Pending struct {
+	Serial string
+	Label  string // e.g. "XQ_BT52 (HQ617A1F6F)"
+}
+
+// Choice is an existing profile a pending phone can be added to.
+type Choice struct {
+	ID, Name string
 }
 
 // Tray owns the systray lifecycle.
@@ -38,12 +55,8 @@ type Tray struct {
 	ready      bool
 	pending    State
 	pendingTip string
-
-	mOpen    *systray.MenuItem
-	mRefresh *systray.MenuItem
-	mMark    *systray.MenuItem
-	mRecon   *systray.MenuItem
-	mQuit    *systray.MenuItem
+	phones     []Pending
+	choices    []Choice
 }
 
 // New builds a Tray with the given callbacks and pre-rendered state icons.
@@ -68,21 +81,13 @@ func (t *Tray) onReady() {
 	systray.SetTitle("smsd")
 	systray.SetTooltip("smsd")
 
-	t.mOpen = systray.AddMenuItem("Open SMS History", "Open the conversation viewer")
-	t.mRefresh = systray.AddMenuItem("Refresh", "Poll the device now")
-	t.mMark = systray.AddMenuItem("Mark notifications read", "Clear unread indicator")
-	t.mRecon = systray.AddMenuItem("Reconnect", "Restart adb and reconnect devices")
-	systray.AddSeparator()
-	t.mQuit = systray.AddMenuItem("Quit", "Stop smsd")
-
-	// Apply whatever state was requested before the tray became ready.
+	// Apply whatever was requested before the tray became ready.
 	t.mu.Lock()
 	t.ready = true
 	state, tip := t.pending, t.pendingTip
+	t.buildMenu()
 	t.mu.Unlock()
 	t.apply(state, tip)
-
-	go t.loop()
 }
 
 func (t *Tray) onExit() {
@@ -91,29 +96,73 @@ func (t *Tray) onExit() {
 	}
 }
 
-// loop dispatches menu clicks. Each handler runs on its own goroutine so a slow
-// action (e.g. reconnect) never freezes the menu.
-func (t *Tray) loop() {
-	for {
-		select {
-		case <-t.mOpen.ClickedCh:
-			go invoke(t.cb.OnOpenHistory)
-		case <-t.mRefresh.ClickedCh:
-			go invoke(t.cb.OnRefresh)
-		case <-t.mMark.ClickedCh:
-			go invoke(t.cb.OnMarkRead)
-		case <-t.mRecon.ClickedCh:
-			go invoke(t.cb.OnReconnect)
-		case <-t.mQuit.ClickedCh:
-			systray.Quit()
-			return
-		}
+// SetPending lists the phones waiting for a profile at the top of the menu,
+// each offering choices to place it in.
+func (t *Tray) SetPending(phones []Pending, choices []Choice) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.phones, t.choices = phones, choices
+	if t.ready {
+		t.buildMenu()
 	}
+}
+
+// buildMenu replaces the whole menu: systray can only append items, and the
+// pending phones belong above the regular actions. Caller holds mu.
+func (t *Tray) buildMenu() {
+	// As in apply, a vanished D-Bus connection at shutdown is not worth a panic.
+	defer func() { _ = recover() }()
+	systray.ResetMenu()
+
+	for _, p := range t.phones {
+		serial := p.Serial
+		m := systray.AddMenuItem("New phone: "+p.Label, "Not synced until you choose a profile")
+		on(m.AddSubMenuItem("Create a new profile", "Keep this phone's data in a profile of its own"),
+			func() { invokeSerial(t.cb.OnNewProfile, serial) })
+		for _, c := range t.choices {
+			id := c.ID
+			on(m.AddSubMenuItem("Add to profile "+c.Name, "Use this phone with an existing profile"),
+				func() {
+					if t.cb.OnAttach != nil {
+						t.cb.OnAttach(serial, id)
+					}
+				})
+		}
+		on(m.AddSubMenuItem("Ignore this phone", "Never sync it"),
+			func() { invokeSerial(t.cb.OnIgnore, serial) })
+	}
+	if len(t.phones) > 0 {
+		systray.AddSeparator()
+	}
+
+	on(systray.AddMenuItem("Open SMS History", "Open the conversation viewer"), t.cb.OnOpenHistory)
+	on(systray.AddMenuItem("Refresh", "Poll the device now"), t.cb.OnRefresh)
+	on(systray.AddMenuItem("Mark notifications read", "Clear unread indicator"), t.cb.OnMarkRead)
+	on(systray.AddMenuItem("Reconnect", "Restart adb and reconnect devices"), t.cb.OnReconnect)
+	systray.AddSeparator()
+	on(systray.AddMenuItem("Quit", "Stop smsd"), systray.Quit)
+}
+
+// on runs fn, on its own goroutine so a slow action (e.g. reconnect) never
+// freezes the menu, each time item is clicked. It stops when a menu rebuild
+// removes the item, which closes its channel.
+func on(item *systray.MenuItem, fn func()) {
+	go func() {
+		for range item.ClickedCh {
+			go invoke(fn)
+		}
+	}()
 }
 
 func invoke(fn func()) {
 	if fn != nil {
 		fn()
+	}
+}
+
+func invokeSerial(fn func(string), serial string) {
+	if fn != nil {
+		fn(serial)
 	}
 }
 

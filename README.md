@@ -21,8 +21,12 @@ installed on the phone.
 ## What it does
 
 - Starts the `adb` server automatically and detects phones via `adb devices`.
-- Connects automatically whenever a phone is plugged in; disconnects are handled
-  gracefully without crashing.
+- Connects automatically whenever a phone you have set up is plugged in;
+  disconnects are handled gracefully without crashing.
+- **Keeps each phone in a profile of its own** — a separate database per
+  profile. A phone smsd has not seen before is **not synced**: it shows up in
+  the tray menu, and nothing is read from it until you create a profile for
+  it, add it to an existing one or ignore it. See [Profiles](#profiles).
 - Imports SMS into SQLite, never duplicating a message.
 - Mirrors the phone's contacts — names, numbers, e-mail and postal addresses,
   organisation, websites, dates, nicknames and notes.
@@ -213,7 +217,8 @@ systemctl --user daemon-reload
 | Purpose        | Location                               |
 | -------------- | -------------------------------------- |
 | Configuration  | `~/.config/smsd/config.json`           |
-| SQLite database| `~/.local/share/smsd/smsd.db`          |
+| Profiles       | `~/.config/smsd/profiles.json`         |
+| Databases      | `~/.local/share/smsd/profiles/<id>.db` (one per profile) |
 | Log file       | `~/.local/state/smsd/log.txt`          |
 
 `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME` are honoured.
@@ -262,6 +267,43 @@ honours `$BROWSER` and your XDG default. Notes:
   running; the browser is launched fire-and-forget, so a failed launch is silent.
 - The server binds to loopback only. Its only write is sending an SMS, which
   it accepts from the viewer page alone — see [Sending](#sending).
+
+### Profiles
+
+Every phone's messages, calls and contacts go into the database of the profile
+it belongs to, and the viewer shows one profile at a time (the **Phone**
+picker in its header; it marks which profiles have a phone connected and how
+many unread items each has). Replies and new messages go out only from a
+phone of the profile on screen, so a borrowed phone can never send for yours.
+
+When a phone that belongs to no profile is plugged in, smsd raises a
+notification and the tray menu gains a **New phone: _model (serial)_** entry:
+
+- **Create a new profile** — a fresh database, named after the phone's model;
+  its history is imported silently, like any first sync.
+- **Add to profile _name_** — for a replacement phone of yours: its history
+  joins that profile.
+- **Ignore this phone** — it is never synced and not offered again.
+
+Until you choose, smsd does not read anything from the phone. The choices are
+stored in `profiles.json`:
+
+```json
+{
+  "profiles": [
+    { "id": "xq-bt52", "name": "XQ_BT52", "devices": ["HQ617A1F6F"] }
+  ],
+  "ignored": ["R58M123ABC"]
+}
+```
+
+`name` may be edited freely (restart smsd afterwards); `id` names the database
+file and must stay as it is. To un-ignore a phone, remove it from `ignored`.
+
+Upgrading from a version without profiles splits the old shared
+`~/.local/share/smsd/smsd.db` once, one profile per phone found in it, named
+after its serial. The old file is left untouched as a backup and can be
+deleted once you are happy with the result.
 
 ### Sending
 
@@ -403,11 +445,12 @@ internal/sms        SMS model + content-query parser  (unit-tested)
 internal/contact    contact model + content-query parser  (unit-tested)
 internal/call       call-log model, content-query and call-state parsers  (unit-tested)
 internal/database   SQLite schema, dedup import, contacts, deletion marks, search  (unit-tested)
+internal/profile    phone-to-profile assignments, one-time split of the shared db  (unit-tested)
 internal/adb        adb client: server, devices, sms/contacts queries
 internal/notify     libnotify (notify-send) notifications
 internal/tray       StatusNotifierItem tray + generated state icons
 internal/ui         embedded web viewer served on loopback, incl. sending
-internal/app        device monitor + per-device incremental sync loops
+internal/app        device monitor, profile approval, per-device incremental sync loops
 ```
 
 The code is deliberately modular: adding **MMS** later means a new query in

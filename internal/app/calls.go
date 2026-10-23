@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jbinder/smsd/internal/call"
+	"github.com/jbinder/smsd/internal/database"
 	"github.com/jbinder/smsd/internal/notify"
 )
 
@@ -47,7 +48,8 @@ func (w *callWatch) drop(n *notify.Notifier) {
 // watchCalls polls the phone's call state: a ringing phone raises an
 // "Incoming call" notification, and the end of any call triggers a call-log
 // read so missed calls are alerted on within a few seconds.
-func (a *App) watchCalls(ctx context.Context, serial string, w *callWatch) {
+func (a *App) watchCalls(ctx context.Context, d *deviceSync, w *callWatch) {
+	serial := d.serial
 	st, err := a.adb.CallState(ctx, serial)
 	if err != nil {
 		if ctx.Err() == nil && !w.stateErr {
@@ -59,12 +61,12 @@ func (a *App) watchCalls(ctx context.Context, serial string, w *callWatch) {
 			a.log.Infof("device %s: call state readable again", serial)
 			w.stateErr = false
 		}
-		a.callStateChanged(serial, w, st)
+		a.callStateChanged(d, w, st)
 	}
 
 	if w.rereads > 0 {
 		w.rereads--
-		a.syncCalls(ctx, serial, w)
+		a.syncCalls(ctx, d, w)
 		// Nothing was missed: the call was answered or rejected.
 		if w.rereads == 0 && w.ringNote != 0 && w.state != call.StateRinging {
 			w.drop(a.note)
@@ -72,14 +74,14 @@ func (a *App) watchCalls(ctx context.Context, serial string, w *callWatch) {
 	}
 }
 
-func (a *App) callStateChanged(serial string, w *callWatch, st call.State) {
+func (a *App) callStateChanged(d *deviceSync, w *callWatch, st call.State) {
 	prev := w.state
 	w.state = st.State
 	switch {
 	case st.Ringing() && (prev != call.StateRinging || st.Number != w.number):
 		w.number = st.Number
-		a.log.Infof("device %s: incoming call from %s", serial, a.callerName(st.Number, call.PresentationUnknown))
-		w.ringNote = a.note.Show("Incoming call", a.callerLine(st.Number),
+		a.log.Infof("device %s: incoming call from %s", d.serial, callerName(d.db, st.Number, call.PresentationUnknown))
+		w.ringNote = a.note.Show("Incoming call", callerLine(d.db, st.Number),
 			notify.Options{Icon: "call-start", Sticky: true, Replace: w.ringNote})
 	case !st.Ringing() && prev == call.StateRinging:
 		w.number = ""
@@ -96,8 +98,9 @@ func (a *App) callStateChanged(serial string, w *callWatch, st call.State) {
 
 // syncCalls imports call-log entries newer than the stored ones and alerts on
 // missed calls among them.
-func (a *App) syncCalls(ctx context.Context, serial string, w *callWatch) {
-	sinceID, _, err := a.db.MaxCallID(serial)
+func (a *App) syncCalls(ctx context.Context, d *deviceSync, w *callWatch) {
+	serial := d.serial
+	sinceID, _, err := d.db.MaxCallID(serial)
 	if err != nil {
 		a.log.Errorf("device %s: call watermark: %v", serial, err)
 		return
@@ -109,7 +112,7 @@ func (a *App) syncCalls(ctx context.Context, serial string, w *callWatch) {
 		}
 		return
 	}
-	res, err := a.db.ImportCalls(serial, calls, w.backfill)
+	res, err := d.db.ImportCalls(serial, calls, w.backfill)
 	if err != nil {
 		a.log.Errorf("device %s: importing calls: %v", serial, err)
 		return
@@ -120,7 +123,7 @@ func (a *App) syncCalls(ctx context.Context, serial string, w *callWatch) {
 	w.backfill = false
 
 	if len(res.NewlyMissed) > 0 {
-		a.notifyMissed(res.NewlyMissed, w)
+		a.notifyMissed(d.db, res.NewlyMissed, w)
 		w.rereads = 0
 	}
 	a.refreshState()
@@ -128,7 +131,7 @@ func (a *App) syncCalls(ctx context.Context, serial string, w *callWatch) {
 
 // notifyMissed alerts on missed calls. The first replaces a still-showing
 // "Incoming call" notification; a burst of more than three is summarised.
-func (a *App) notifyMissed(calls []call.Call, w *callWatch) {
+func (a *App) notifyMissed(db *database.DB, calls []call.Call, w *callWatch) {
 	opt := notify.Options{Icon: "call-missed"}
 	// A call ringing right now keeps its notification.
 	if w.state != call.StateRinging {
@@ -140,8 +143,8 @@ func (a *App) notifyMissed(calls []call.Call, w *callWatch) {
 		return
 	}
 	for _, c := range calls {
-		a.log.Infof("missed call from %s", a.callerName(c.Number, c.Presentation))
-		body := a.callerLine(c.Number)
+		a.log.Infof("missed call from %s", callerName(db, c.Number, c.Presentation))
+		body := callerLine(db, c.Number)
 		if c.Number == "" {
 			body = call.PresentationLabel(c.Presentation)
 		}
@@ -156,11 +159,11 @@ func (a *App) notifyMissed(calls []call.Call, w *callWatch) {
 
 // callerName is the contact name for number, or the number, or why there is
 // none.
-func (a *App) callerName(number string, presentation int) string {
+func callerName(db *database.DB, number string, presentation int) string {
 	if number == "" {
 		return call.PresentationLabel(presentation)
 	}
-	if name, err := a.db.ContactName(number); err == nil && name != "" {
+	if name, err := db.ContactName(number); err == nil && name != "" {
 		return name
 	}
 	return number
@@ -168,18 +171,19 @@ func (a *App) callerName(number string, presentation int) string {
 
 // callerLine is a notification body naming the caller, with the number
 // alongside a contact name.
-func (a *App) callerLine(number string) string {
+func callerLine(db *database.DB, number string) string {
 	if number == "" {
 		return "Unknown number"
 	}
-	if name, err := a.db.ContactName(number); err == nil && name != "" {
+	if name, err := db.ContactName(number); err == nil && name != "" {
 		return name + "\n" + number
 	}
 	return number
 }
 
 // checkDeletedCalls marks stored calls cleared from the phone's call log.
-func (a *App) checkDeletedCalls(ctx context.Context, serial string) {
+func (a *App) checkDeletedCalls(ctx context.Context, d *deviceSync) {
+	serial := d.serial
 	ids, err := a.adb.QueryCallIDs(ctx, serial)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -192,7 +196,7 @@ func (a *App) checkDeletedCalls(ctx context.Context, serial string) {
 		a.log.Warnf("device %s: phone returned no call ids, skipping deletion check", serial)
 		return
 	}
-	res, err := a.db.ReconcileCalls(serial, ids)
+	res, err := d.db.ReconcileCalls(serial, ids)
 	if err != nil {
 		a.log.Errorf("device %s: checking for deleted calls: %v", serial, err)
 		return

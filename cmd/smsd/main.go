@@ -14,9 +14,9 @@ import (
 	"github.com/jbinder/smsd/internal/adb"
 	"github.com/jbinder/smsd/internal/app"
 	"github.com/jbinder/smsd/internal/config"
-	"github.com/jbinder/smsd/internal/database"
 	"github.com/jbinder/smsd/internal/logging"
 	"github.com/jbinder/smsd/internal/notify"
+	"github.com/jbinder/smsd/internal/profile"
 	"github.com/jbinder/smsd/internal/tray"
 	"github.com/jbinder/smsd/internal/ui"
 )
@@ -57,23 +57,37 @@ func run() error {
 		return err
 	}
 	defer logger.Close()
-	logger.Infof("smsd %s starting (config=%s db=%s)", version, paths.ConfigFile, paths.DBFile)
+	logger.Infof("smsd %s starting (config=%s profiles=%s)", version, paths.ConfigFile, paths.ProfilesFile)
 
-	db, err := database.Open(paths.DBFile)
+	profiles, err := profile.Load(paths.ProfilesFile)
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	// Older versions kept every phone in one database. Split it once, one
+	// profile per phone, so their histories stop mixing.
+	migrated, err := profile.MigrateShared(profiles, paths.DBFile, paths.ProfilesDir)
+	if err != nil {
+		return fmt.Errorf("splitting %s into profiles: %w", paths.DBFile, err)
+	}
+	for _, p := range migrated {
+		logger.Infof("moved phone %s into profile %s (%s); %s is kept as a backup",
+			p.Devices[0], p.Name, profile.DBPath(paths.ProfilesDir, p), paths.DBFile)
+	}
 
 	client := adb.New(cfg.ADBPath)
 	notifier := notify.New(cfg.NotifyEnabled, cfg.NotifyTimeoutSeconds)
 	if cfg.NotifyEnabled && !notifier.Available() {
 		logger.Warnf("notify-send not found on PATH; desktop notifications disabled")
 	}
-	viewer := ui.New(db, cfg.UIAddr, logger)
+	viewer := ui.New(nil, cfg.UIAddr, logger)
 	defer viewer.Stop()
 
-	application := app.New(cfg, logger, client, db, notifier, viewer)
+	application, err := app.New(cfg, logger, client, profiles, paths.ProfilesDir, notifier, viewer)
+	if err != nil {
+		return err
+	}
+	defer application.Close()
+	viewer.SetProfiles(application)
 	viewer.SetSender(application)
 	viewer.SetOnRead(application.ReadChanged)
 
@@ -85,6 +99,9 @@ func run() error {
 		OnRefresh:     application.Refresh,
 		OnMarkRead:    application.MarkRead,
 		OnReconnect:   func() { application.Reconnect(ctx) },
+		OnNewProfile:  application.NewProfile,
+		OnAttach:      application.Attach,
+		OnIgnore:      application.Ignore,
 		OnQuit: func() {
 			logger.Infof("quit requested")
 			cancel()

@@ -50,7 +50,7 @@ func newTestServer(t *testing.T, n int) (*httptest.Server, *database.DB) {
 	}
 	t.Cleanup(func() { log.Close() })
 
-	s := New(db, "127.0.0.1:0", log)
+	s := New(single(db), "127.0.0.1:0", log)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/state", s.handleState)
 	mux.HandleFunc("/api/conversations", s.handleConversations)
@@ -61,6 +61,27 @@ func newTestServer(t *testing.T, n int) (*httptest.Server, *database.DB) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, db
+}
+
+// fakeProfiles serves a fixed set of profiles, in order.
+type fakeProfiles struct {
+	ids []string
+	dbs map[string]*database.DB
+}
+
+func (f *fakeProfiles) Profiles() []ProfileInfo {
+	var out []ProfileInfo
+	for _, id := range f.ids {
+		out = append(out, ProfileInfo{ID: id, Name: strings.ToUpper(id)})
+	}
+	return out
+}
+
+func (f *fakeProfiles) ProfileDB(id string) *database.DB { return f.dbs[id] }
+
+// single is one profile, "p1", holding db.
+func single(db *database.DB) *fakeProfiles {
+	return &fakeProfiles{ids: []string{"p1"}, dbs: map[string]*database.DB{"p1": db}}
 }
 
 func getJSON(t *testing.T, srv *httptest.Server, path string, into any) {
@@ -251,9 +272,9 @@ type fakeSender struct {
 	sent   []string
 }
 
-func (f *fakeSender) SendStatus() error { return f.status }
-func (f *fakeSender) Send(ctx context.Context, address, body string) (string, error) {
-	f.sent = append(f.sent, address+": "+body)
+func (f *fakeSender) SendStatus(profile string) error { return f.status }
+func (f *fakeSender) Send(ctx context.Context, profile, address, body string) (string, error) {
+	f.sent = append(f.sent, profile+" "+address+": "+body)
 	return address, nil
 }
 
@@ -269,7 +290,7 @@ func TestSendEndpointAuthorisation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer log.Close()
-	s := New(db, "127.0.0.1:0", log)
+	s := New(single(db), "127.0.0.1:0", log)
 	fake := &fakeSender{}
 	s.SetSender(fake)
 	mux := http.NewServeMux()
@@ -334,7 +355,7 @@ func TestSendEndpointAuthorisation(t *testing.T) {
 	if got := send("POST", ok, good); got != http.StatusOK {
 		t.Fatalf("authorised send: status %d", got)
 	}
-	if len(fake.sent) != 1 || fake.sent[0] != "+15551234567: hi" {
+	if len(fake.sent) != 1 || fake.sent[0] != "p1 +15551234567: hi" {
 		t.Errorf("sent = %v", fake.sent)
 	}
 
@@ -401,7 +422,7 @@ func TestReadEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer log.Close()
-	s := New(db, "127.0.0.1:0", log)
+	s := New(single(db), "127.0.0.1:0", log)
 	hooked := 0
 	s.SetOnRead(func() { hooked++ })
 	mux := http.NewServeMux()
@@ -454,5 +475,80 @@ func TestReadEndpoint(t *testing.T) {
 	}
 	if hooked != 2 {
 		t.Errorf("hook ran %d times, want 2", hooked)
+	}
+}
+
+func TestProfilesAreSeparate(t *testing.T) {
+	dir := t.TempDir()
+	open := func(name, device, body string) *database.DB {
+		t.Helper()
+		db, err := database.Open(filepath.Join(dir, name+".db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		if _, err := db.ImportMessages(device, []sms.Message{
+			{AndroidID: 1, ThreadID: 1, Address: "+15551234567", Body: body, Date: 1000, Type: sms.TypeReceived},
+		}, true); err != nil {
+			t.Fatal(err)
+		}
+		return db
+	}
+	profiles := &fakeProfiles{ids: []string{"mine", "other"}, dbs: map[string]*database.DB{
+		"mine":  open("mine", "dev1", "for me"),
+		"other": open("other", "dev2", "for someone else"),
+	}}
+	log, err := logging.New(filepath.Join(dir, "log.txt"), 1<<20, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	s := New(profiles, "127.0.0.1:0", log)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/state", s.handleState)
+	mux.HandleFunc("/api/messages", s.handleMessages)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	body := func(query string) string {
+		t.Helper()
+		var page database.MessagePage
+		getJSON(t, srv, "/api/messages?address=%2B15551234567"+query, &page)
+		if len(page.Messages) != 1 {
+			t.Fatalf("%s: got %d messages, want 1", query, len(page.Messages))
+		}
+		return page.Messages[0].Body
+	}
+	if got := body("&profile=other"); got != "for someone else" {
+		t.Errorf("profile other shows %q", got)
+	}
+	if got := body("&profile=mine"); got != "for me" {
+		t.Errorf("profile mine shows %q", got)
+	}
+	if got := body(""); got != "for me" {
+		t.Errorf("no profile named shows %q, want the first profile's", got)
+	}
+
+	resp, err := srv.Client().Get(srv.URL + "/api/messages?address=x&profile=nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown profile: status %d, want 404", resp.StatusCode)
+	}
+
+	var st viewerState
+	getJSON(t, srv, "/api/state?profile=other", &st)
+	if len(st.Profiles) != 2 || st.Profiles[1].ID != "other" || st.Count != 1 {
+		t.Errorf("state = %+v", st)
+	}
+
+	// Before any phone is set up the state still answers, with no profiles.
+	profiles.ids = nil
+	st = viewerState{}
+	getJSON(t, srv, "/api/state", &st)
+	if len(st.Profiles) != 0 || st.CanSend {
+		t.Errorf("state without profiles = %+v", st)
 	}
 }

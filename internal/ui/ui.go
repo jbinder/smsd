@@ -33,18 +33,37 @@ var assets embed.FS
 
 // Sender sends SMS on the viewer's behalf.
 type Sender interface {
-	// SendStatus returns nil when sending can work, or why it cannot.
-	SendStatus() error
-	// Send sends body to address and returns the address actually used.
-	Send(ctx context.Context, address, body string) (string, error)
+	// SendStatus returns nil when sending from profile can work, or why it
+	// cannot.
+	SendStatus(profile string) error
+	// Send sends body to address from one of profile's phones and returns the
+	// address actually used.
+	Send(ctx context.Context, profile, address, body string) (string, error)
+}
+
+// ProfileInfo describes one profile for the viewer's profile switcher.
+type ProfileInfo struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Connected bool   `json:"connected"`
+	Unread    int    `json:"unread"`
+}
+
+// Profiles gives the viewer the profiles and their databases. Every request
+// names the profile it is about; each profile's history stays in its own
+// database.
+type Profiles interface {
+	Profiles() []ProfileInfo
+	// ProfileDB returns the database of profile id, or nil if there is none.
+	ProfileDB(id string) *database.DB
 }
 
 // Server is the loopback web viewer. It starts lazily on first Open.
 type Server struct {
-	db     *database.DB
-	log    *logging.Logger
-	addr   string
-	sender Sender
+	profiles Profiles
+	log      *logging.Logger
+	addr     string
+	sender   Sender
 	// onRead runs after the viewer marked something read, so the tray can
 	// drop its unread indicator.
 	onRead func()
@@ -58,14 +77,37 @@ type Server struct {
 	running bool
 }
 
-// New creates a viewer server bound (on start) to addr, e.g. "127.0.0.1:0".
-func New(db *database.DB, addr string, log *logging.Logger) *Server {
+// New creates a viewer server over profiles, bound (on start) to addr, e.g.
+// "127.0.0.1:0".
+func New(profiles Profiles, addr string, log *logging.Logger) *Server {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		panic(err) // crypto/rand does not fail on Linux
 	}
-	return &Server{db: db, log: log, addr: addr, token: hex.EncodeToString(buf)}
+	return &Server{profiles: profiles, log: log, addr: addr, token: hex.EncodeToString(buf)}
 }
+
+// profileDB returns the id and database of the profile the request names in
+// its profile parameter, or the first profile when it names none. It answers
+// the request itself and returns a nil database when there is no such
+// profile.
+func (s *Server) profileDB(w http.ResponseWriter, r *http.Request) (string, *database.DB) {
+	id := r.URL.Query().Get("profile")
+	if id == "" {
+		if list := s.profiles.Profiles(); len(list) > 0 {
+			id = list[0].ID
+		}
+	}
+	db := s.profiles.ProfileDB(id)
+	if db == nil {
+		http.Error(w, "no such profile", http.StatusNotFound)
+	}
+	return id, db
+}
+
+// SetProfiles sets where the viewer finds the profiles; New may be given nil
+// when they are only available later.
+func (s *Server) SetProfiles(p Profiles) { s.profiles = p }
 
 // SetSender enables sending from the viewer.
 func (s *Server) SetSender(sender Sender) { s.sender = sender }
@@ -159,18 +201,32 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-// viewerState is the database fingerprint plus whether sending works right
-// now, so the compose box can say why it is disabled.
+// viewerState is the profile's database fingerprint plus whether sending
+// works right now, so the compose box can say why it is disabled, and the
+// list of profiles for the switcher.
 type viewerState struct {
 	database.State
-	CanSend   bool   `json:"can_send"`
-	SendError string `json:"send_error,omitempty"`
+	CanSend   bool          `json:"can_send"`
+	SendError string        `json:"send_error,omitempty"`
+	Profiles  []ProfileInfo `json:"profiles"`
 }
 
+// handleState also answers when there are no profiles yet, so the viewer can
+// say how to set one up.
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
-	state, err := s.db.State()
-	v := viewerState{State: state}
-	if sendErr := s.sendStatus(); sendErr != nil {
+	v := viewerState{Profiles: s.profiles.Profiles()}
+	if len(v.Profiles) == 0 {
+		v.SendError = "no phone set up yet"
+		s.writeJSON(w, v, nil)
+		return
+	}
+	id, db := s.profileDB(w, r)
+	if db == nil {
+		return
+	}
+	state, err := db.State()
+	v.State = state
+	if sendErr := s.sendStatus(id); sendErr != nil {
 		v.SendError = sendErr.Error()
 	} else {
 		v.CanSend = true
@@ -178,11 +234,11 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, v, err)
 }
 
-func (s *Server) sendStatus() error {
+func (s *Server) sendStatus(profile string) error {
 	if s.sender == nil {
 		return fmt.Errorf("sending is not available")
 	}
-	return s.sender.SendStatus()
+	return s.sender.SendStatus(profile)
 }
 
 // sendTimeout bounds a send. It is not tied to the request: a browser that
@@ -201,6 +257,10 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	profile, db := s.profileDB(w, r)
+	if db == nil {
+		return
+	}
 	var req struct {
 		Address string `json:"address"`
 		Body    string `json:"body"`
@@ -213,13 +273,13 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "recipient and message are required", http.StatusBadRequest)
 		return
 	}
-	if err := s.sendStatus(); err != nil {
+	if err := s.sendStatus(profile); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
-	sentTo, err := s.sender.Send(ctx, req.Address, req.Body)
+	sentTo, err := s.sender.Send(ctx, profile, req.Address, req.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -242,6 +302,10 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	_, db := s.profileDB(w, r)
+	if db == nil {
+		return
+	}
 	var req struct {
 		Address string `json:"address"`
 		Calls   bool   `json:"calls"`
@@ -258,9 +322,9 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 	var n int64
 	var err error
 	if req.Calls {
-		n, err = s.db.MarkCallsRead(req.Until)
+		n, err = db.MarkCallsRead(req.Until)
 	} else {
-		n, err = s.db.MarkConversationRead(req.Address, req.Until)
+		n, err = db.MarkConversationRead(req.Address, req.Until)
 	}
 	if err == nil && n > 0 && s.onRead != nil {
 		s.onRead()
@@ -308,7 +372,11 @@ func isLoopbackHost(hostport string) bool {
 }
 
 func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {
-	convs, err := s.db.Conversations(
+	_, db := s.profileDB(w, r)
+	if db == nil {
+		return
+	}
+	convs, err := db.Conversations(
 		sinceParam(r),
 		intParam(r, "limit", 100, 1000),
 		intParam(r, "offset", 0, 1<<30),
@@ -326,18 +394,26 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		Date:      int64(intParam(r, "before_date", 0, 1<<62)),
 		AndroidID: int64(intParam(r, "before_id", 0, 1<<62)),
 	}
-	page, err := s.db.Messages(addr, sinceParam(r), cur, intParam(r, "limit", 200, 1000))
+	_, db := s.profileDB(w, r)
+	if db == nil {
+		return
+	}
+	page, err := db.Messages(addr, sinceParam(r), cur, intParam(r, "limit", 200, 1000))
 	s.writeJSON(w, page, err)
 }
 
 // handleCalls pages the call log, newest first, optionally for one number.
 // It takes the same window and cursor parameters as handleMessages.
 func (s *Server) handleCalls(w http.ResponseWriter, r *http.Request) {
+	_, db := s.profileDB(w, r)
+	if db == nil {
+		return
+	}
 	cur := database.Cursor{
 		Date:      int64(intParam(r, "before_date", 0, 1<<62)),
 		AndroidID: int64(intParam(r, "before_id", 0, 1<<62)),
 	}
-	page, err := s.db.Calls(r.URL.Query().Get("number"), sinceParam(r), cur,
+	page, err := db.Calls(r.URL.Query().Get("number"), sinceParam(r), cur,
 		intParam(r, "limit", 200, 1000))
 	s.writeJSON(w, page, err)
 }
@@ -372,14 +448,22 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, []struct{}{}, nil)
 		return
 	}
-	msgs, err := s.db.Search(q)
+	_, db := s.profileDB(w, r)
+	if db == nil {
+		return
+	}
+	msgs, err := db.Search(q)
 	s.writeJSON(w, msgs, err)
 }
 
 // handleContacts lists every contact, deleted ones included; there are few
 // enough that the viewer filters them itself.
 func (s *Server) handleContacts(w http.ResponseWriter, r *http.Request) {
-	contacts, err := s.db.Contacts()
+	_, db := s.profileDB(w, r)
+	if db == nil {
+		return
+	}
+	contacts, err := db.Contacts()
 	s.writeJSON(w, contacts, err)
 }
 
@@ -389,7 +473,11 @@ func (s *Server) handleContact(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "id required", http.StatusBadRequest)
 		return
 	}
-	card, ok, err := s.db.Contact(id)
+	_, db := s.profileDB(w, r)
+	if db == nil {
+		return
+	}
+	card, ok, err := db.Contact(id)
 	if err == nil && !ok {
 		http.NotFound(w, r)
 		return
