@@ -50,7 +50,7 @@ func (w *callWatch) drop(n *notify.Notifier) {
 // read so missed calls are alerted on within a few seconds.
 func (a *App) watchCalls(ctx context.Context, d *deviceSync, w *callWatch) {
 	serial := d.serial
-	st, err := a.adb.CallState(ctx, serial)
+	st, err := a.adb.CallState(ctx, d.conn)
 	if err != nil {
 		if ctx.Err() == nil && !w.stateErr {
 			a.log.Warnf("device %s: reading call state (incoming-call alerts paused): %v", serial, err)
@@ -105,7 +105,7 @@ func (a *App) syncCalls(ctx context.Context, d *deviceSync, w *callWatch) {
 		a.log.Errorf("device %s: call watermark: %v", serial, err)
 		return
 	}
-	calls, err := a.adb.QueryCalls(ctx, serial, sinceID)
+	calls, err := a.adb.QueryCalls(ctx, d.conn, d.user, sinceID)
 	if err != nil {
 		if ctx.Err() == nil {
 			a.log.Warnf("device %s: querying call log: %v", serial, err)
@@ -184,7 +184,7 @@ func callerLine(db *database.DB, number string) string {
 // checkDeletedCalls marks stored calls cleared from the phone's call log.
 func (a *App) checkDeletedCalls(ctx context.Context, d *deviceSync) {
 	serial := d.serial
-	ids, err := a.adb.QueryCallIDs(ctx, serial)
+	ids, err := a.adb.QueryCallIDs(ctx, d.conn, d.user)
 	if err != nil {
 		if ctx.Err() == nil {
 			a.log.Warnf("device %s: listing call ids: %v", serial, err)

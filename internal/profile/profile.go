@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -23,6 +24,33 @@ type Profile struct {
 	ID      string   `json:"id"`
 	Name    string   `json:"name"`
 	Devices []string `json:"devices"`
+	// Users holds, per phone, the Android user whose contacts and call log
+	// are read. A phone shared by several people has a user each, and they
+	// have contacts and call logs of their own; SMS are shared by all users.
+	// A phone missing here is read as user 0, the owner.
+	Users map[string]int `json:"users,omitempty"`
+}
+
+// User returns the Android user read on phone serial.
+func (p Profile) User(serial string) int { return p.Users[serial] }
+
+// clone copies p so the store's slices and maps are not shared.
+func (p Profile) clone() Profile {
+	p.Devices = slices.Clone(p.Devices)
+	p.Users = maps.Clone(p.Users)
+	return p
+}
+
+// setUser records user for serial, leaving the default (0) unwritten.
+func (p *Profile) setUser(serial string, user int) {
+	if user == 0 {
+		delete(p.Users, serial)
+		return
+	}
+	if p.Users == nil {
+		p.Users = map[string]int{}
+	}
+	p.Users[serial] = user
 }
 
 type file struct {
@@ -84,8 +112,7 @@ func (s *Store) List() []Profile {
 	defer s.mu.Unlock()
 	out := make([]Profile, len(s.f.Profiles))
 	for i, p := range s.f.Profiles {
-		p.Devices = slices.Clone(p.Devices)
-		out[i] = p
+		out[i] = p.clone()
 	}
 	return out
 }
@@ -117,9 +144,10 @@ func (s *Store) Ignored(serial string) bool {
 	return slices.Contains(s.f.Ignored, serial)
 }
 
-// Create adds a profile called name holding serials and saves the store. Its
-// id is derived from the name and made unique.
-func (s *Store) Create(name string, serials ...string) (Profile, error) {
+// Create adds a profile called name holding serials, each read as Android
+// user user, and saves the store. Its id is derived from the name and made
+// unique.
+func (s *Store) Create(name string, user int, serials ...string) (Profile, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, serial := range serials {
@@ -128,17 +156,21 @@ func (s *Store) Create(name string, serials ...string) (Profile, error) {
 		}
 	}
 	p := Profile{ID: s.uniqueID(slug(name)), Name: name, Devices: slices.Clone(serials)}
+	for _, serial := range serials {
+		p.setUser(serial, user)
+	}
 	s.f.Profiles = append(s.f.Profiles, p)
 	s.unignore(serials...)
 	if err := s.save(); err != nil {
 		s.f.Profiles = s.f.Profiles[:len(s.f.Profiles)-1]
 		return Profile{}, err
 	}
-	return p, nil
+	return p.clone(), nil
 }
 
-// Attach adds serial to the existing profile id and saves the store.
-func (s *Store) Attach(id, serial string) (Profile, error) {
+// Attach adds serial, read as Android user user, to the existing profile id
+// and saves the store.
+func (s *Store) Attach(id, serial string, user int) (Profile, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if owner := s.owner(serial); owner != "" {
@@ -150,14 +182,14 @@ func (s *Store) Attach(id, serial string) (Profile, error) {
 			continue
 		}
 		p.Devices = append(p.Devices, serial)
+		p.setUser(serial, user)
 		s.unignore(serial)
 		if err := s.save(); err != nil {
 			p.Devices = p.Devices[:len(p.Devices)-1]
+			delete(p.Users, serial)
 			return Profile{}, err
 		}
-		out := *p
-		out.Devices = slices.Clone(p.Devices)
-		return out, nil
+		return p.clone(), nil
 	}
 	return Profile{}, fmt.Errorf("no profile %q", id)
 }

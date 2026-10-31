@@ -118,6 +118,36 @@ func (c *Client) GetState(ctx context.Context, serial string) (string, error) {
 	return strings.TrimSpace(out), err
 }
 
+// SerialNo returns the phone's own serial number. adb names a phone by its
+// connection: over USB that is the same serial, but over Wi-Fi it is the
+// address, e.g. "192.168.0.44:5555". The serial number stays the same however
+// the phone is connected, so it is what identifies the phone.
+func (c *Client) SerialNo(ctx context.Context, serial string) (string, error) {
+	out, err := c.run(ctx, "-s", serial, "shell", "getprop ro.serialno")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// CurrentUser returns the Android user in the foreground on the phone; 0 is
+// the owner, and a phone without extra users only has that one.
+func (c *Client) CurrentUser(ctx context.Context, serial string) (int, error) {
+	out, err := c.run(ctx, "-s", serial, "shell", "am get-current-user")
+	if err != nil {
+		return 0, err
+	}
+	return parseUser(out)
+}
+
+func parseUser(out string) (int, error) {
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("unexpected user id %q", strings.TrimSpace(out))
+	}
+	return n, nil
+}
+
 // ErrNoRows is returned by QuerySMS when the provider reports no matching rows.
 var ErrNoRows = errors.New("no rows")
 
@@ -174,12 +204,13 @@ func (c *Client) QuerySMSTypes(ctx context.Context, serial string, ids []int64) 
 	return types, nil
 }
 
-// QueryCalls reads the call log for a device. Like QuerySMS, a sinceID > 0
-// requests only newer rows.
-func (c *Client) QueryCalls(ctx context.Context, serial string, sinceID int64) ([]call.Call, error) {
+// QueryCalls reads the call log of Android user user on a device. Each user
+// has a call log of its own. Like QuerySMS, a sinceID > 0 requests only newer
+// rows.
+func (c *Client) QueryCalls(ctx context.Context, serial string, user int, sinceID int64) ([]call.Call, error) {
 	remote := fmt.Sprintf(
-		"content query --uri content://call_log/calls --projection %s --sort '_id ASC'",
-		call.ProjectionArg())
+		"content query --user %d --uri content://call_log/calls --projection %s --sort '_id ASC'",
+		user, call.ProjectionArg())
 	if sinceID > 0 {
 		remote += fmt.Sprintf(" --where '_id>%d'", sinceID)
 	}
@@ -190,10 +221,11 @@ func (c *Client) QueryCalls(ctx context.Context, serial string, sinceID int64) (
 	return call.ParseQueryOutput(out), nil
 }
 
-// QueryCallIDs lists the _id of every call log entry on the device, for
+// QueryCallIDs lists the _id of every entry in user's call log, for
 // noticing deletions the same way QuerySMSIDs does.
-func (c *Client) QueryCallIDs(ctx context.Context, serial string) ([]int64, error) {
-	out, err := c.run(ctx, "-s", serial, "shell", "content query --uri content://call_log/calls --projection _id")
+func (c *Client) QueryCallIDs(ctx context.Context, serial string, user int) ([]int64, error) {
+	out, err := c.run(ctx, "-s", serial, "shell",
+		fmt.Sprintf("content query --user %d --uri content://call_log/calls --projection _id", user))
 	if err != nil {
 		return nil, err
 	}
@@ -222,12 +254,13 @@ func (c *Client) CallState(ctx context.Context, serial string) (call.State, erro
 	return st, nil
 }
 
-// QueryContacts reads every contact and its details (numbers, e-mail
-// addresses, …) from the Contacts Provider. Both queries must succeed: a
-// partial read would make the missing half look deleted.
-func (c *Client) QueryContacts(ctx context.Context, serial string) ([]contact.Contact, []contact.Detail, error) {
+// QueryContacts reads every contact of Android user user and its details
+// (numbers, e-mail addresses, …) from the Contacts Provider; each user has
+// contacts of its own. Both queries must succeed: a partial read would make
+// the missing half look deleted.
+func (c *Client) QueryContacts(ctx context.Context, serial string, user int) ([]contact.Contact, []contact.Detail, error) {
 	out, err := c.run(ctx, "-s", serial, "shell",
-		"content query --uri content://com.android.contacts/contacts --projection "+
+		fmt.Sprintf("content query --user %d --uri content://com.android.contacts/contacts --projection ", user)+
 			strings.Join(contact.ContactProjection, ":"))
 	if err != nil {
 		return nil, nil, err
@@ -235,7 +268,7 @@ func (c *Client) QueryContacts(ctx context.Context, serial string) ([]contact.Co
 	contacts := contact.ParseContacts(out)
 
 	out, err = c.run(ctx, "-s", serial, "shell",
-		"content query --uri content://com.android.contacts/data --projection "+
+		fmt.Sprintf("content query --user %d --uri content://com.android.contacts/data --projection ", user)+
 			strings.Join(contact.DetailProjection, ":"))
 	if err != nil {
 		return nil, nil, err

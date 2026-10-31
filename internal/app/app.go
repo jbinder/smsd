@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -40,16 +41,27 @@ type App struct {
 	mu       sync.Mutex
 	ctx      context.Context         // Run's context, for loops started from the tray
 	dbs      map[string]*database.DB // open databases by profile id
-	devices  map[string]*deviceSync  // active per-device sync loops
-	pending  map[string]adb.Device   // connected phones in no profile, awaiting a choice
+	ids      map[string]string       // phone serial number by adb connection, learned once per connection
+	devices  map[string]*deviceSync  // active sync loops by phone serial number
+	pending  map[string]phone        // connected phones in no profile, awaiting a choice
 	ignoring map[string]bool         // connected phones set to be ignored, logged once
 	adbError bool                    // last device-list poll failed
 	wg       sync.WaitGroup
 }
 
+// phone is a connected phone: its serial number, which identifies it in the
+// profiles and databases, and the adb connection it is reached through. Over
+// USB the two are the same; over Wi-Fi the connection is an address.
+type phone struct {
+	id   string
+	conn adb.Device
+}
+
 // deviceSync tracks one connected device's sync goroutine.
 type deviceSync struct {
-	serial  string
+	serial  string       // the phone's serial number, its name in the database
+	conn    string       // the adb connection, for running commands
+	user    int          // Android user whose contacts and call log are read
 	profile string       // id of the profile the device belongs to
 	db      *database.DB // that profile's database
 	cancel  context.CancelFunc
@@ -70,8 +82,9 @@ func New(cfg config.Config, log *logging.Logger, client *adb.Client, profiles *p
 		ui:       viewer,
 		ctx:      context.Background(),
 		dbs:      make(map[string]*database.DB),
+		ids:      make(map[string]string),
 		devices:  make(map[string]*deviceSync),
-		pending:  make(map[string]adb.Device),
+		pending:  make(map[string]phone),
 		ignoring: make(map[string]bool),
 	}
 	for _, p := range profiles.List() {
@@ -157,8 +170,9 @@ func (a *App) Run(ctx context.Context) {
 }
 
 // scanDevices reconciles the set of connected devices with running sync loops.
-// It only performs the cheap local `adb devices` call; SMS polling happens in
-// per-device goroutines and only while connected.
+// It only performs the cheap local `adb devices` call, plus one getprop the
+// first time a connection appears; SMS polling happens in per-device
+// goroutines and only while connected.
 func (a *App) scanDevices(ctx context.Context) {
 	devs, err := a.adb.Devices(ctx)
 	if err != nil {
@@ -170,71 +184,93 @@ func (a *App) scanDevices(ctx context.Context) {
 		return
 	}
 
-	connected := map[string]adb.Device{}
+	// A phone plugged in over USB and connected over Wi-Fi is listed twice;
+	// it is one phone, known by its serial number.
+	conns := map[string][]adb.Device{} // by phone serial number
 	unusable := false
+	listed := map[string]bool{}
 	for _, d := range devs {
-		if d.Connected() {
-			connected[d.Serial] = d
-		} else {
+		listed[d.Serial] = true
+		if !d.Connected() {
 			// e.g. "unauthorized" or "offline": surfaced as an error state.
 			unusable = true
 			a.log.Warnf("device %s is %s", d.Serial, d.State)
+			continue
 		}
+		id, ok := a.phoneID(ctx, d.Serial)
+		if !ok {
+			unusable = true
+			continue
+		}
+		conns[id] = append(conns[id], d)
 	}
 
-	var arrived []adb.Device
+	var arrived []phone
 	pendingChanged := false
 	a.mu.Lock()
 	a.adbError = unusable
+	for conn := range a.ids {
+		if !listed[conn] {
+			delete(a.ids, conn)
+		}
+	}
+	// Cancel loops whose connection went away. A phone still reachable over
+	// another connection is picked up again below.
+	for id, ds := range a.devices {
+		if !slices.ContainsFunc(conns[id], func(d adb.Device) bool { return d.Serial == ds.conn }) {
+			if len(conns[id]) == 0 {
+				a.log.Infof("device %s disconnected", id)
+			} else {
+				a.log.Infof("device %s: connection %s went away", id, ds.conn)
+			}
+			ds.cancel()
+			delete(a.devices, id)
+		}
+	}
 	// Start loops for newly connected devices that belong to a profile; hold
 	// back the rest.
-	for serial, d := range connected {
-		if _, ok := a.devices[serial]; ok {
+	for id, cs := range conns {
+		if _, ok := a.devices[id]; ok {
 			continue
 		}
-		if p, ok := a.profiles.ForDevice(serial); ok {
-			a.startDevice(ctx, serial, p)
+		ph := phone{id: id, conn: cs[0]}
+		if p, ok := a.profiles.ForDevice(id); ok {
+			a.startDevice(ctx, ph, p)
 			continue
 		}
-		if a.profiles.Ignored(serial) {
-			if !a.ignoring[serial] {
-				a.log.Infof("device %s connected, ignored (see profiles.json)", serial)
-				a.ignoring[serial] = true
+		if a.profiles.Ignored(id) {
+			if !a.ignoring[id] {
+				a.log.Infof("device %s connected, ignored (see profiles.json)", id)
+				a.ignoring[id] = true
 			}
 			continue
 		}
-		if _, ok := a.pending[serial]; !ok {
-			a.log.Infof("device %s (%s) connected, belongs to no profile: not syncing until one is chosen", serial, d.Model)
-			a.pending[serial] = d
-			arrived = append(arrived, d)
+		if _, ok := a.pending[id]; !ok {
+			a.log.Infof("device %s connected, belongs to no profile: not syncing until one is chosen", phoneLabel(ph))
+			a.pending[id] = ph
+			arrived = append(arrived, ph)
 			pendingChanged = true
 		}
 	}
-	// Cancel loops for devices that went away.
-	for serial, ds := range a.devices {
-		if _, ok := connected[serial]; !ok {
-			a.log.Infof("device %s disconnected", serial)
-			ds.cancel()
-			delete(a.devices, serial)
-		}
-	}
-	for serial := range a.pending {
-		if _, ok := connected[serial]; !ok {
-			a.log.Infof("device %s disconnected without a profile", serial)
-			delete(a.pending, serial)
+	for id, ph := range a.pending {
+		if len(conns[id]) == 0 {
+			a.log.Infof("device %s disconnected without a profile", id)
+			delete(a.pending, id)
 			pendingChanged = true
+		} else if !slices.Contains(conns[id], ph.conn) {
+			a.pending[id] = phone{id: id, conn: conns[id][0]}
 		}
 	}
-	for serial := range a.ignoring {
-		if _, ok := connected[serial]; !ok {
-			delete(a.ignoring, serial)
+	for id := range a.ignoring {
+		if len(conns[id]) == 0 {
+			delete(a.ignoring, id)
 		}
 	}
 	a.mu.Unlock()
 
-	for _, d := range arrived {
+	for _, ph := range arrived {
 		a.note.Notify("New phone connected",
-			phoneLabel(d)+" is not synced. Choose a profile for it in the smsd tray menu.")
+			phoneLabel(ph)+" is not synced. Choose a profile for it in the smsd tray menu.")
 	}
 	if pendingChanged {
 		a.UpdateTrayMenu()
@@ -242,18 +278,52 @@ func (a *App) scanDevices(ctx context.Context) {
 	a.refreshState()
 }
 
-// startDevice launches a sync goroutine for serial into p's database. Caller
+// phoneID returns the serial number of the phone on adb connection conn,
+// asking the phone the first time the connection is seen. It reports false
+// when the phone could not be asked; the next scan tries again.
+func (a *App) phoneID(ctx context.Context, conn string) (string, bool) {
+	a.mu.Lock()
+	id, ok := a.ids[conn]
+	a.mu.Unlock()
+	if ok {
+		return id, true
+	}
+	id, err := a.adb.SerialNo(ctx, conn)
+	if err != nil {
+		a.log.Warnf("device %s: reading serial number: %v", conn, err)
+		return "", false
+	}
+	if id == "" {
+		// Some builds leave it unset; the connection name is all there is.
+		id = conn
+	}
+	if id != conn {
+		a.log.Infof("device %s is phone %s", conn, id)
+	}
+	a.mu.Lock()
+	a.ids[conn] = id
+	a.mu.Unlock()
+	return id, true
+}
+
+// startDevice launches a sync goroutine for ph into p's database. Caller
 // must hold a.mu.
-func (a *App) startDevice(parent context.Context, serial string, p profile.Profile) {
+func (a *App) startDevice(parent context.Context, ph phone, p profile.Profile) {
 	db := a.dbs[p.ID]
 	if db == nil {
-		a.log.Errorf("device %s: database of profile %s is not open", serial, p.Name)
+		a.log.Errorf("device %s: database of profile %s is not open", ph.id, p.Name)
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)
-	ds := &deviceSync{serial: serial, profile: p.ID, db: db, cancel: cancel, poke: make(chan struct{}, 1)}
-	a.devices[serial] = ds
-	a.log.Infof("device %s connected, starting sync into profile %s", serial, p.Name)
+	ds := &deviceSync{serial: ph.id, conn: ph.conn.Serial, user: p.User(ph.id), profile: p.ID,
+		db: db, cancel: cancel, poke: make(chan struct{}, 1)}
+	a.devices[ph.id] = ds
+	via := ""
+	if ds.conn != ds.serial {
+		via = " via " + ds.conn
+	}
+	a.log.Infof("device %s connected%s, starting sync of Android user %d into profile %s",
+		ds.serial, via, ds.user, p.Name)
 
 	a.wg.Add(1)
 	go func() {
@@ -263,11 +333,11 @@ func (a *App) startDevice(parent context.Context, serial string, p profile.Profi
 }
 
 // phoneLabel names a phone for the user, e.g. "XQ_BT52 (HQ617A1F6F)".
-func phoneLabel(d adb.Device) string {
-	if d.Model == "" {
-		return d.Serial
+func phoneLabel(ph phone) string {
+	if ph.conn.Model == "" {
+		return ph.id
 	}
-	return d.Model + " (" + d.Serial + ")"
+	return ph.conn.Model + " (" + ph.id + ")"
 }
 
 // --- profiles ---------------------------------------------------------------
@@ -279,8 +349,8 @@ func (a *App) UpdateTrayMenu() {
 	}
 	a.mu.Lock()
 	phones := make([]tray.Pending, 0, len(a.pending))
-	for _, d := range a.pending {
-		phones = append(phones, tray.Pending{Serial: d.Serial, Label: phoneLabel(d)})
+	for _, ph := range a.pending {
+		phones = append(phones, tray.Pending{Serial: ph.id, Label: phoneLabel(ph)})
 	}
 	a.mu.Unlock()
 	sort.Slice(phones, func(i, j int) bool { return phones[i].Serial < phones[j].Serial })
@@ -293,66 +363,87 @@ func (a *App) UpdateTrayMenu() {
 }
 
 // takePending removes serial from the phones awaiting a profile.
-func (a *App) takePending(serial string) (adb.Device, bool) {
+func (a *App) takePending(serial string) (phone, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	d, ok := a.pending[serial]
+	ph, ok := a.pending[serial]
 	delete(a.pending, serial)
-	return d, ok
+	return ph, ok
+}
+
+// foregroundUser returns the Android user in the foreground on ph. That is
+// the person handling the phone while it is being set up, so it is whose
+// contacts and call log the profile gets.
+func (a *App) foregroundUser(ph phone) (int, error) {
+	ctx, cancel := context.WithTimeout(a.ctx, 20*time.Second)
+	defer cancel()
+	user, err := a.adb.CurrentUser(ctx, ph.conn.Serial)
+	if err != nil {
+		return 0, fmt.Errorf("reading the phone's current user: %w", err)
+	}
+	return user, nil
 }
 
 // NewProfile puts a waiting phone into a new profile of its own, named after
 // its model, and starts syncing it.
 func (a *App) NewProfile(serial string) {
-	d, ok := a.takePending(serial)
+	ph, ok := a.takePending(serial)
 	if !ok {
 		return
 	}
-	name := d.Model
+	name := ph.conn.Model
 	if name == "" {
 		name = serial
 	}
-	p, err := a.profiles.Create(name, serial)
+	var p profile.Profile
+	user, err := a.foregroundUser(ph)
+	if err == nil {
+		p, err = a.profiles.Create(name, user, serial)
+	}
 	if err == nil {
 		_, err = a.openDB(p)
 	}
 	if err != nil {
 		a.log.Errorf("device %s: creating profile: %v", serial, err)
-		a.note.Notify("smsd", "Could not create a profile for "+phoneLabel(d)+": "+err.Error())
-		a.restorePending(d)
+		a.note.Notify("smsd", "Could not create a profile for "+phoneLabel(ph)+": "+err.Error())
+		a.restorePending(ph)
 		return
 	}
-	a.log.Infof("device %s: created profile %s (%s)", serial, p.Name, p.ID)
-	a.adopt(serial, p)
+	a.log.Infof("device %s: created profile %s (%s) for Android user %d", serial, p.Name, p.ID, user)
+	a.adopt(ph, p)
 }
 
 // Attach adds a waiting phone to an existing profile, e.g. the replacement
 // for a phone already in it, and starts syncing it.
 func (a *App) Attach(serial, profileID string) {
-	d, ok := a.takePending(serial)
+	ph, ok := a.takePending(serial)
 	if !ok {
 		return
 	}
-	p, err := a.profiles.Attach(profileID, serial)
+	var p profile.Profile
+	user, err := a.foregroundUser(ph)
+	if err == nil {
+		p, err = a.profiles.Attach(profileID, serial, user)
+	}
 	if err != nil {
 		a.log.Errorf("device %s: adding to profile %s: %v", serial, profileID, err)
-		a.note.Notify("smsd", "Could not add "+phoneLabel(d)+" to the profile: "+err.Error())
-		a.restorePending(d)
+		a.note.Notify("smsd", "Could not add "+phoneLabel(ph)+" to the profile: "+err.Error())
+		a.restorePending(ph)
 		return
 	}
-	a.log.Infof("device %s: added to profile %s", serial, p.Name)
-	a.adopt(serial, p)
+	a.log.Infof("device %s: added to profile %s for Android user %d", serial, p.Name, user)
+	a.adopt(ph, p)
 }
 
 // Ignore stops offering a waiting phone; it is never synced.
 func (a *App) Ignore(serial string) {
-	d, ok := a.takePending(serial)
+	ph, ok := a.takePending(serial)
 	if !ok {
 		return
 	}
 	if err := a.profiles.Ignore(serial); err != nil {
 		a.log.Errorf("device %s: ignoring: %v", serial, err)
-		a.restorePending(d)
+		a.restorePending(ph)
 		return
 	}
 	a.mu.Lock()
@@ -363,19 +454,19 @@ func (a *App) Ignore(serial string) {
 	a.refreshState()
 }
 
-// restorePending puts d back among the waiting phones after a failed choice.
-func (a *App) restorePending(d adb.Device) {
+// restorePending puts ph back among the waiting phones after a failed choice.
+func (a *App) restorePending(ph phone) {
 	a.mu.Lock()
-	a.pending[d.Serial] = d
+	a.pending[ph.id] = ph
 	a.mu.Unlock()
 	a.UpdateTrayMenu()
 }
 
-// adopt starts syncing serial into p now that it has a profile.
-func (a *App) adopt(serial string, p profile.Profile) {
+// adopt starts syncing ph into p now that it has a profile.
+func (a *App) adopt(ph phone, p profile.Profile) {
 	a.mu.Lock()
-	if _, ok := a.devices[serial]; !ok {
-		a.startDevice(a.ctx, serial, p)
+	if _, ok := a.devices[ph.id]; !ok {
+		a.startDevice(a.ctx, ph, p)
 	}
 	a.mu.Unlock()
 	a.UpdateTrayMenu()
@@ -483,7 +574,7 @@ func (a *App) pollOnce(ctx context.Context, d *deviceSync, backfill *bool) {
 		a.log.Errorf("device %s: watermark: %v", serial, err)
 		return
 	}
-	msgs, err := a.adb.QuerySMS(ctx, serial, sinceID)
+	msgs, err := a.adb.QuerySMS(ctx, d.conn, sinceID)
 	if err != nil {
 		if ctx.Err() != nil {
 			return // cancelled: device unplugged, not a real error
@@ -525,7 +616,7 @@ func (a *App) settlePending(ctx context.Context, d *deviceSync) {
 		}
 		return
 	}
-	types, err := a.adb.QuerySMSTypes(ctx, serial, ids)
+	types, err := a.adb.QuerySMSTypes(ctx, d.conn, ids)
 	if err != nil {
 		if ctx.Err() == nil {
 			a.log.Warnf("device %s: re-reading pending messages: %v", serial, err)
@@ -574,7 +665,7 @@ func truncate(s string, n int) string {
 // not failing on error (contacts are best-effort).
 func (a *App) syncContacts(ctx context.Context, d *deviceSync) {
 	serial := d.serial
-	contacts, details, err := a.adb.QueryContacts(ctx, serial)
+	contacts, details, err := a.adb.QueryContacts(ctx, d.conn, d.user)
 	if err != nil {
 		if ctx.Err() == nil {
 			a.log.Warnf("device %s: querying contacts: %v", serial, err)
@@ -606,7 +697,7 @@ func (a *App) checkDeleted(ctx context.Context, d *deviceSync) {
 
 func (a *App) checkDeletedSMS(ctx context.Context, d *deviceSync) {
 	serial := d.serial
-	ids, err := a.adb.QuerySMSIDs(ctx, serial)
+	ids, err := a.adb.QuerySMSIDs(ctx, d.conn)
 	if err != nil {
 		if ctx.Err() == nil {
 			a.log.Warnf("device %s: listing sms ids: %v", serial, err)
@@ -643,7 +734,7 @@ func (a *App) SendStatus(profile string) error {
 	if !a.cfg.SendEnabled {
 		return ErrSendDisabled
 	}
-	if serial, _ := a.sendDevice(profile, ""); serial == "" {
+	if serial, _, _ := a.sendDevice(profile, ""); serial == "" {
 		return ErrNoDevice
 	}
 	return nil
@@ -671,13 +762,13 @@ func (a *App) Send(ctx context.Context, profile, address, body string) (string, 
 	if err != nil {
 		return "", err
 	}
-	serial, poke := a.sendDevice(profile, preferred)
+	serial, conn, poke := a.sendDevice(profile, preferred)
 	if serial == "" {
 		return "", ErrNoDevice
 	}
 
 	parts := sms.Split(body)
-	if err := a.adb.SendSMS(ctx, serial, address, parts); err != nil {
+	if err := a.adb.SendSMS(ctx, conn, address, parts); err != nil {
 		a.log.Errorf("device %s: sending to %s: %v", serial, address, err)
 		return "", err
 	}
@@ -690,13 +781,13 @@ func (a *App) Send(ctx context.Context, profile, address, body string) (string, 
 }
 
 // sendDevice picks the connected device of profile to send from, preferring
-// preferred, and returns it with its poke channel. A phone never sends for
-// another profile.
-func (a *App) sendDevice(profile, preferred string) (string, chan struct{}) {
+// preferred, and returns its serial number, adb connection and poke channel.
+// A phone never sends for another profile.
+func (a *App) sendDevice(profile, preferred string) (string, string, chan struct{}) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if ds, ok := a.devices[preferred]; ok && ds.profile == profile {
-		return preferred, ds.poke
+		return preferred, ds.conn, ds.poke
 	}
 	serials := make([]string, 0, len(a.devices))
 	for s, ds := range a.devices {
@@ -705,10 +796,11 @@ func (a *App) sendDevice(profile, preferred string) (string, chan struct{}) {
 		}
 	}
 	if len(serials) == 0 {
-		return "", nil
+		return "", "", nil
 	}
 	sort.Strings(serials)
-	return serials[0], a.devices[serials[0]].poke
+	ds := a.devices[serials[0]]
+	return serials[0], ds.conn, ds.poke
 }
 
 // --- tray state -----------------------------------------------------------

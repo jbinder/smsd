@@ -291,7 +291,12 @@ stored in `profiles.json`:
 ```json
 {
   "profiles": [
-    { "id": "xq-bt52", "name": "XQ_BT52", "devices": ["HQ617A1F6F"] }
+    {
+      "id": "xq-bt52",
+      "name": "XQ_BT52",
+      "devices": ["HQ617A1F6F"],
+      "users": { "HQ617A1F6F": 10 }
+    }
   ],
   "ignored": ["R58M123ABC"]
 }
@@ -299,6 +304,18 @@ stored in `profiles.json`:
 
 `name` may be edited freely (restart smsd afterwards); `id` names the database
 file and must stay as it is. To un-ignore a phone, remove it from `ignored`.
+
+A phone is known by its own serial number (`ro.serialno`), not by how adb
+reaches it, so the same phone over USB and over Wi-Fi (`adb connect`, where
+adb calls it e.g. `192.168.0.44:5555`) is one phone with one history. If both
+connections are up at once, it is synced through one of them.
+
+On a phone with several Android users, each user has contacts and a call log
+of their own (SMS are shared by all of them). `users` records which user's
+contacts and calls a phone gives its profile: the user in the foreground when
+you chose the profile in the tray. A phone missing from `users` is read as
+user 0, the owner. To change it, stop smsd and edit the number; contacts and
+calls already stored are those of the previous user.
 
 Upgrading from a version without profiles splits the old shared
 `~/.local/share/smsd/smsd.db` once, one profile per phone found in it, named

@@ -23,23 +23,23 @@ func TestStorePersistsAssignments(t *testing.T) {
 		t.Fatal("unknown phone has a profile")
 	}
 
-	p, err := s.Create("XQ_BT52", "A1")
+	p, err := s.Create("XQ_BT52", 0, "A1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if p.ID != "xq-bt52" {
 		t.Errorf("id = %q", p.ID)
 	}
-	if q, _ := s.Create("XQ BT52"); q.ID != "xq-bt52-2" {
+	if q, _ := s.Create("XQ BT52", 0); q.ID != "xq-bt52-2" {
 		t.Errorf("second id = %q, want a unique one", q.ID)
 	}
-	if _, err := s.Create("again", "A1"); err == nil {
+	if _, err := s.Create("again", 0, "A1"); err == nil {
 		t.Error("a phone was put in two profiles")
 	}
-	if _, err := s.Attach("xq-bt52", "B2"); err != nil {
+	if _, err := s.Attach("xq-bt52", "B2", 10); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Attach("nope", "C3"); err == nil {
+	if _, err := s.Attach("nope", "C3", 0); err == nil {
 		t.Error("attached to a missing profile")
 	}
 	if err := s.Ignore("D4"); err != nil {
@@ -58,12 +58,16 @@ func TestStorePersistsAssignments(t *testing.T) {
 			t.Errorf("%s belongs to %+v", serial, got)
 		}
 	}
+	// Each phone keeps the Android user it is read as.
+	if p, _ := s.ForDevice("B2"); p.User("B2") != 10 || p.User("A1") != 0 {
+		t.Errorf("users = %v, want B2 read as user 10 and A1 as the owner", p.Users)
+	}
 	if !s.Ignored("D4") || s.Ignored("A1") {
 		t.Error("ignore list not kept")
 	}
 
 	// Choosing a profile for an ignored phone takes it off the list.
-	if _, err := s.Attach("xq-bt52", "D4"); err != nil {
+	if _, err := s.Attach("xq-bt52", "D4", 0); err != nil {
 		t.Fatal(err)
 	}
 	if s.Ignored("D4") {

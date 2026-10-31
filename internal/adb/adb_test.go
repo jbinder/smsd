@@ -67,3 +67,16 @@ func TestParseParcelInt(t *testing.T) {
 		t.Errorf("garbage reply: want error")
 	}
 }
+
+func TestParseUser(t *testing.T) {
+	for in, want := range map[string]int{"0\n": 0, "10\r\n": 10} {
+		if got, err := parseUser(in); err != nil || got != want {
+			t.Errorf("parseUser(%q) = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "-1", "Error: no user"} {
+		if _, err := parseUser(in); err == nil {
+			t.Errorf("parseUser(%q) accepted garbage", in)
+		}
+	}
+}
