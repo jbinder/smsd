@@ -136,6 +136,61 @@ No companion app is required. smsd only issues standard, non-root `content query
 commands against `content://sms`, the contacts provider and the call log, and
 reads the call state with `dumpsys telephony.registry`.
 
+### Over Wi-Fi, without a cable
+
+On Android 11 and later, smsd can reach the phone over Wi-Fi through
+**Wireless debugging**. The phone advertises itself on the local network
+(mDNS), and smsd connects to any phone it finds that is not connected yet.
+This matters because the port changes every time Wireless debugging is turned
+on, so a fixed `adb connect` address stops working.
+
+**On the phone**, once. On a multi-user phone, do this in the owner (admin)
+user: secondary users have no Developer options and cannot approve Wireless
+debugging. After that, it works with any user in the foreground.
+
+1. Developer options → **Wireless debugging** → on. If asked, allow it on
+   this network.
+2. If the computer is not already listed under *Paired devices*, tap
+   **Pair device with pairing code** and run
+   `adb pair <ip>:<pairing port> <code>` with the address and code it shows.
+   A computer already authorised for USB debugging is usually listed already.
+3. Optional: add the **Wireless debugging** tile under Developer options →
+   *Quick settings developer tiles*, to turn it back on from the notification
+   shade.
+
+**On the computer**, the firewall must let the phone's mDNS replies in. If
+`adb mdns services` stays empty while Wireless debugging is on, that is
+usually why: firewalld's default `public` zone allows no mDNS. To allow it
+only on your home Wi-Fi, give that connection a zone of its own, `public`
+plus mDNS (replace `HomeWiFi` with the connection name from
+`nmcli connection show`):
+
+```sh
+sudo firewall-cmd --permanent --new-zone=home-wifi
+sudo firewall-cmd --permanent --zone=home-wifi \
+    --add-service=ssh --add-service=dhcpv6-client --add-service=mdns
+sudo firewall-cmd --reload
+nmcli connection modify HomeWiFi connection.zone home-wifi
+nmcli connection up HomeWiFi
+```
+
+Other networks keep using `public`. Then check:
+
+```sh
+adb mdns services   # lists adb-<serial>-…  _adb-tls-connect._tcp  <ip>:<port>
+```
+
+Limits:
+
+- Android only allows Wireless debugging on networks approved on the phone. On
+  a new network, approve it from the owner user. From a secondary user the
+  prompt is refused, and Wireless debugging turns off on that network.
+- Android turns Wireless debugging off whenever the phone's Wi-Fi disconnects
+  or changes, and possibly after a restart. Turn it back on (owner user, or
+  the tile), or have an app on the phone do it.
+- smsd retries an address it could not connect to (e.g. a phone not paired
+  with this computer) every 30 seconds, and logs a warning the first time.
+
 ## Build & install
 
 ```sh
@@ -482,7 +537,9 @@ or notifier. Supporting sending on another Android release means adding its
 - Sending needs a supported Android version (currently 13) and a SIM.
 - SMS and calls only. MMS is not imported yet, and **RCS chat messages can never be**
   (they are not readable over adb) — keep RCS turned off.
-- Requires the phone unlocked and USB debugging authorised for the host.
+- Requires the phone unlocked and USB debugging authorised for the host
+  (or Wireless debugging paired with it, see
+  [Over Wi-Fi](#over-wi-fi-without-a-cable)).
 
 ## License
 

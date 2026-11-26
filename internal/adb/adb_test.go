@@ -80,3 +80,23 @@ func TestParseUser(t *testing.T) {
 		}
 	}
 }
+
+func TestParseServices(t *testing.T) {
+	out := "List of discovered mdns services\n" +
+		"adb-HQ617A1F6F-a1b2c3\t_adb-tls-connect._tcp\t192.168.0.44:37215\n" +
+		"adb-HQ617A1F6F-a1b2c3\t_adb-tls-pairing._tcp\t192.168.0.44:41011\n" +
+		"adb-XYZ-9-ffffff  _adb-tls-connect._tcp.  10.0.0.5:40001\n"
+	svcs := parseServices(out)
+	if len(svcs) != 2 {
+		t.Fatalf("got %d services, want 2: %+v", len(svcs), svcs)
+	}
+	if s := svcs[0]; s.Addr != "192.168.0.44:37215" || s.Serial() != "HQ617A1F6F" {
+		t.Errorf("first service wrong: %+v serial %q", s, s.Serial())
+	}
+	if s := svcs[1]; s.Addr != "10.0.0.5:40001" || s.Serial() != "XYZ-9" {
+		t.Errorf("second service wrong: %+v serial %q", s, s.Serial())
+	}
+	if s := (Service{Instance: "phone"}); s.Serial() != "" {
+		t.Errorf("odd instance name gave serial %q", s.Serial())
+	}
+}

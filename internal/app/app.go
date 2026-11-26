@@ -46,6 +46,7 @@ type App struct {
 	pending  map[string]phone        // connected phones in no profile, awaiting a choice
 	ignoring map[string]bool         // connected phones set to be ignored, logged once
 	adbError bool                    // last device-list poll failed
+	dialed   map[string]time.Time    // Wi-Fi addresses by when smsd last tried to connect to them
 	wg       sync.WaitGroup
 }
 
@@ -276,6 +277,47 @@ func (a *App) scanDevices(ctx context.Context) {
 		a.UpdateTrayMenu()
 	}
 	a.refreshState()
+	a.connectWireless(ctx, conns)
+}
+
+// redialAfter is how long smsd waits before trying a Wi-Fi address again
+// that it could not connect to, e.g. a phone not paired with this computer.
+const redialAfter = 30 * time.Second
+
+// connectWireless connects to phones that have Wireless debugging turned on
+// and are not connected yet, so a paired phone needs no USB cable and no
+// manual `adb connect`, although its port changes each time. conns holds the
+// phones already connected, by serial number; a new connection shows up in
+// the next scan.
+func (a *App) connectWireless(ctx context.Context, conns map[string][]adb.Device) {
+	svcs, err := a.adb.WirelessServices(ctx)
+	if err != nil {
+		return // an adb without mDNS support: Wi-Fi then needs a manual connect
+	}
+	now := time.Now()
+	for _, s := range svcs {
+		if id := s.Serial(); id != "" && len(conns[id]) > 0 {
+			continue
+		}
+		a.mu.Lock()
+		if a.dialed == nil {
+			a.dialed = map[string]time.Time{}
+		}
+		last, tried := a.dialed[s.Addr]
+		if tried && now.Sub(last) < redialAfter {
+			a.mu.Unlock()
+			continue
+		}
+		a.dialed[s.Addr] = now
+		a.mu.Unlock()
+		if err := a.adb.Connect(ctx, s.Addr); err != nil {
+			if !tried {
+				a.log.Warnf("connecting over Wi-Fi to %s (paired with this computer?): %v", s.Instance, err)
+			}
+			continue
+		}
+		a.log.Infof("connected over Wi-Fi to %s at %s", s.Instance, s.Addr)
+	}
 }
 
 // phoneID returns the serial number of the phone on adb connection conn,

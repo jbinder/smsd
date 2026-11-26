@@ -420,3 +420,65 @@ func parcelText(body string) string {
 	}
 	return strings.Join(strings.Fields(strings.ReplaceAll(b.String(), ".", "")), " ")
 }
+
+// Service is a phone advertising Wireless debugging (Android 11+) on the
+// local network, as found by the adb server's mDNS discovery.
+type Service struct {
+	Instance string // e.g. "adb-HQ617A1F6F-a1b2c3"
+	Addr     string // host:port to connect to; the port changes every time Wireless debugging is turned on
+}
+
+// Serial returns the phone's serial number, which Android puts in the
+// instance name as "adb-<serial>-<random>", or "" if the name has another form.
+func (s Service) Serial() string {
+	rest, ok := strings.CutPrefix(s.Instance, "adb-")
+	if !ok {
+		return ""
+	}
+	i := strings.LastIndex(rest, "-")
+	if i <= 0 {
+		return ""
+	}
+	return rest[:i]
+}
+
+// connectService is the mDNS service type of a phone that can be connected
+// to; a phone showing its pairing code also advertises _adb-tls-pairing.
+const connectService = "_adb-tls-connect._tcp"
+
+// WirelessServices lists the phones on the local network that have Wireless
+// debugging turned on. Only a phone paired with this computer accepts a
+// connection.
+func (c *Client) WirelessServices(ctx context.Context) ([]Service, error) {
+	out, err := c.run(ctx, "mdns", "services")
+	if err != nil {
+		return nil, err
+	}
+	return parseServices(out), nil
+}
+
+func parseServices(out string) []Service {
+	var svcs []Service
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) != 3 || !strings.HasPrefix(f[1], connectService) {
+			continue
+		}
+		svcs = append(svcs, Service{Instance: f[0], Addr: f[2]})
+	}
+	return svcs
+}
+
+// Connect connects to a phone over Wi-Fi. `adb connect` exits 0 even when it
+// fails, so its output is checked.
+func (c *Client) Connect(ctx context.Context, addr string) error {
+	out, err := c.run(ctx, "connect", addr)
+	if err != nil {
+		return err
+	}
+	out = strings.TrimSpace(out)
+	if !strings.HasPrefix(out, "connected to") && !strings.HasPrefix(out, "already connected to") {
+		return fmt.Errorf("adb connect %s: %s", addr, out)
+	}
+	return nil
+}
