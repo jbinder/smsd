@@ -100,3 +100,18 @@ func TestParseServices(t *testing.T) {
 		t.Errorf("odd instance name gave serial %q", s.Serial())
 	}
 }
+
+func TestIsNetwork(t *testing.T) {
+	for serial, want := range map[string]bool{
+		"192.168.0.44:5555":  true,
+		"192.168.0.44:39921": true,
+		"[fe80::1]:5555":     true,
+		"HQ617A1F6F":         false,
+		"emulator-5554":      false,
+		"adb-HQ617A1F6F-a1b2c3._adb-tls-connect._tcp": false,
+	} {
+		if got := IsNetwork(serial); got != want {
+			t.Errorf("IsNetwork(%q) = %v, want %v", serial, got, want)
+		}
+	}
+}

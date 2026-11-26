@@ -190,6 +190,15 @@ Limits:
   the tile), or have an app on the phone do it.
 - smsd retries an address it could not connect to (e.g. a phone not paired
   with this computer) every 30 seconds, and logs a warning the first time.
+- When the phone leaves the network, adb keeps listing it as connected for up
+  to about 15 minutes, and every command to it hangs. smsd checks each Wi-Fi
+  connection every 10 seconds and drops it (`adb disconnect`) after two
+  checks in a row go unanswered within 5 seconds.
+- smsd remembers the Wi-Fi address it last reached each synced phone at, and
+  tries it again every 30 seconds while the phone is not connected. That
+  brings back a phone in `adb tcpip` mode (port 5555), which is not advertised
+  over mDNS. An `adb disconnect` of a synced phone is therefore undone within
+  30 seconds; stop smsd, or plug the phone in over USB, to keep it off Wi-Fi.
 
 ## Build & install
 

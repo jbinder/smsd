@@ -47,6 +47,8 @@ type App struct {
 	ignoring map[string]bool         // connected phones set to be ignored, logged once
 	adbError bool                    // last device-list poll failed
 	dialed   map[string]time.Time    // Wi-Fi addresses by when smsd last tried to connect to them
+	lastAddr map[string]string       // Wi-Fi address each synced phone was last connected through, by serial number
+	probes   map[string]*probe       // health of Wi-Fi connections, by address
 	wg       sync.WaitGroup
 }
 
@@ -87,6 +89,9 @@ func New(cfg config.Config, log *logging.Logger, client *adb.Client, profiles *p
 		devices:  make(map[string]*deviceSync),
 		pending:  make(map[string]phone),
 		ignoring: make(map[string]bool),
+		dialed:   make(map[string]time.Time),
+		lastAddr: make(map[string]string),
+		probes:   make(map[string]*probe),
 	}
 	for _, p := range profiles.List() {
 		if _, err := a.openDB(p); err != nil {
@@ -191,6 +196,9 @@ func (a *App) scanDevices(ctx context.Context) {
 	unusable := false
 	listed := map[string]bool{}
 	for _, d := range devs {
+		if d.Connected() && !a.alive(ctx, d.Serial) {
+			continue // dropped: treated as gone from the list
+		}
 		listed[d.Serial] = true
 		if !d.Connected() {
 			// e.g. "unauthorized" or "offline": surfaced as an error state.
@@ -213,6 +221,21 @@ func (a *App) scanDevices(ctx context.Context) {
 	for conn := range a.ids {
 		if !listed[conn] {
 			delete(a.ids, conn)
+		}
+	}
+	for conn := range a.probes {
+		if !listed[conn] {
+			delete(a.probes, conn)
+		}
+	}
+	for id, cs := range conns {
+		if _, ok := a.profiles.ForDevice(id); !ok {
+			continue
+		}
+		for _, d := range cs {
+			if adb.IsNetwork(d.Serial) {
+				a.lastAddr[id] = d.Serial
+			}
 		}
 	}
 	// Cancel loops whose connection went away. A phone still reachable over
@@ -290,6 +313,7 @@ const redialAfter = 30 * time.Second
 // phones already connected, by serial number; a new connection shows up in
 // the next scan.
 func (a *App) connectWireless(ctx context.Context, conns map[string][]adb.Device) {
+	a.redialLast(conns)
 	svcs, err := a.adb.WirelessServices(ctx)
 	if err != nil {
 		return // an adb without mDNS support: Wi-Fi then needs a manual connect
@@ -300,9 +324,6 @@ func (a *App) connectWireless(ctx context.Context, conns map[string][]adb.Device
 			continue
 		}
 		a.mu.Lock()
-		if a.dialed == nil {
-			a.dialed = map[string]time.Time{}
-		}
 		last, tried := a.dialed[s.Addr]
 		if tried && now.Sub(last) < redialAfter {
 			a.mu.Unlock()
@@ -318,6 +339,117 @@ func (a *App) connectWireless(ctx context.Context, conns map[string][]adb.Device
 		}
 		a.log.Infof("connected over Wi-Fi to %s at %s", s.Instance, s.Addr)
 	}
+}
+
+// redialTimeout bounds a background `adb connect` to a remembered address.
+// A phone that has left the network does not refuse the connection, it just
+// never answers.
+const redialTimeout = 10 * time.Second
+
+// redialLast reconnects synced phones that are not connected to the Wi-Fi
+// address they were last connected through, every redialAfter. That catches
+// a phone in `adb tcpip` mode, which is not advertised over mDNS, coming back
+// after its connection was dropped. Each attempt runs in the background, since
+// an address nobody answers on takes a while to fail.
+func (a *App) redialLast(conns map[string][]adb.Device) {
+	now := time.Now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for id, addr := range a.lastAddr {
+		if len(conns[id]) > 0 {
+			continue
+		}
+		last, tried := a.dialed[addr]
+		if tried && now.Sub(last) < redialAfter {
+			continue
+		}
+		a.dialed[addr] = now
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			ctx, cancel := context.WithTimeout(a.ctx, redialTimeout)
+			defer cancel()
+			if err := a.adb.Connect(ctx, addr); err != nil {
+				if !tried && a.ctx.Err() == nil {
+					a.log.Infof("device %s: not reachable at %s yet, retrying every %s: %v", id, addr, redialAfter, err)
+				}
+				return
+			}
+			a.log.Infof("device %s: reconnected over Wi-Fi at %s", id, addr)
+		}()
+	}
+}
+
+// probe is the health of one Wi-Fi connection.
+type probe struct {
+	last  time.Time // when it was last checked
+	fails int       // checks in a row it did not answer
+}
+
+const (
+	probeEvery   = 10 * time.Second // how often a Wi-Fi connection is checked
+	probeTimeout = 5 * time.Second  // how long the phone has to answer
+	probeFails   = 2                // unanswered checks in a row before it is dropped
+)
+
+// alive reports whether the phone on adb connection conn still answers. Only
+// Wi-Fi connections are checked: adb keeps listing one as connected for up to
+// about 15 minutes after the phone has left the network, while every command
+// to it hangs. A connection that stops answering is disconnected, which ends
+// its sync loop and frees adb of it; the phone's address is redialed (see
+// redialLast).
+func (a *App) alive(ctx context.Context, conn string) bool {
+	if !adb.IsNetwork(conn) {
+		return true
+	}
+	a.mu.Lock()
+	p := a.probes[conn]
+	if p == nil {
+		p = &probe{}
+		a.probes[conn] = p
+	}
+	due := time.Since(p.last) >= probeEvery
+	if due {
+		p.last = time.Now()
+	}
+	a.mu.Unlock()
+	if !due {
+		return true
+	}
+
+	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	err := a.adb.Ping(pctx, conn)
+	cancel()
+	if ctx.Err() != nil {
+		return true // shutting down; nothing to judge
+	}
+	a.mu.Lock()
+	if err == nil {
+		if p.fails > 0 {
+			a.log.Infof("device %s answers again", conn)
+		}
+		p.fails = 0
+		a.mu.Unlock()
+		return true
+	}
+	p.fails++
+	fails := p.fails
+	if fails >= probeFails {
+		delete(a.probes, conn)
+	}
+	a.mu.Unlock()
+
+	if fails < probeFails {
+		a.log.Warnf("device %s did not answer within %s", conn, probeTimeout)
+		return true
+	}
+	a.log.Warnf("device %s did not answer %d times in a row: dropping the connection", conn, fails)
+	dctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	if err := a.adb.Disconnect(dctx, conn); err != nil {
+		a.log.Warnf("disconnecting %s: %v", conn, err)
+	}
+	return false
 }
 
 // phoneID returns the serial number of the phone on adb connection conn,

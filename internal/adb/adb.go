@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -481,4 +482,27 @@ func (c *Client) Connect(ctx context.Context, addr string) error {
 		return fmt.Errorf("adb connect %s: %s", addr, out)
 	}
 	return nil
+}
+
+// Disconnect drops a Wi-Fi connection from the adb server's device list.
+func (c *Client) Disconnect(ctx context.Context, addr string) error {
+	_, err := c.run(ctx, "disconnect", addr)
+	return err
+}
+
+// Ping runs a no-op on the phone and reports whether it answered. adb keeps
+// listing a Wi-Fi connection as "device" for many minutes after the phone has
+// left the network, until the kernel gives up on the TCP connection, and every
+// command to it hangs until then; this is how such a connection is told apart.
+// ctx bounds how long to wait.
+func (c *Client) Ping(ctx context.Context, serial string) error {
+	_, err := c.run(ctx, "-s", serial, "shell", "true")
+	return err
+}
+
+// IsNetwork reports whether serial names an adb connection over the network,
+// "<ip>:<port>", as opposed to a USB serial number.
+func IsNetwork(serial string) bool {
+	host, port, err := net.SplitHostPort(serial)
+	return err == nil && port != "" && net.ParseIP(host) != nil
 }
